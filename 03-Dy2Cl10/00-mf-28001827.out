@@ -1,0 +1,1443 @@
+START TIME =  09/03/2022 03:53:26
+#INFO: **** input file is /central/groups/changroup/members/hczhai/work/SOC-DMRG-Data/04-Dy2Cl10/00-dy-20o-dzbp-mf-1step.py ****
+
+import time
+from datetime import datetime
+txst = time.perf_counter()
+print("START TIME = ", datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
+
+from pyscf import scf, mcscf, gto
+from pyblock2._pyscf import scf as b2scf
+from pyblock2._pyscf import mcscf as b2mcscf
+from pyblock2.driver.core import DMRGDriver, SymmetryTypes
+from pyblock2._pyscf.ao2mo import soc_integrals as itgsoc
+import numpy as np
+import pickle
+
+fidx = 0
+
+b = 2.72
+
+coords = [
+    ['Dy', [0, 0, 0]],
+    ['Dy', [b, b, 0]],
+    ['Cl', [-b, 0, 0]],
+    ['Cl', [b, 0, 0]],
+    ['Cl', [0, -b,  0]],
+    ['Cl', [0, b,  0]],
+    ['Cl', [0, 0, -b]],
+    ['Cl', [0, 0, b]],
+    ['Cl', [b, 2 * b, 0]],
+    ['Cl', [2 * b, b, 0]],
+    ['Cl', [b, b, -b]],
+    ['Cl', [b, b, b]]
+]
+
+mol = gto.M(atom=coords, basis={"Dy": "ano@7s6p4d2f", "Cl": "ano@4s3p"},
+            verbose=4, spin=10, charge=-4, max_memory=100000)
+print('basis = dz nelec = %d nao = %d' % (mol.nelectron, mol.nao))
+
+mf = scf.UKS(mol).x2c()
+mf = b2scf.smearing_(mf, sigma=0.2, method="fermi", fit_spin=True)
+mf.xc = "bp86"
+mf.conv_tol = 1e-10
+mf.max_cycle = 500
+mf.diis_space = 15
+
+dm0 = b2scf.get_metal_init_guess(mol, orb="4f", atom_idxs=[0, 1], coupling="++", atomic_spin=5)
+mf.kernel(dm0=dm0)
+dmao = np.einsum('yij->ij', mf.make_rdm1(), optimize=True)
+
+lo_coeff, lo_occ, lo_energy = b2mcscf.get_uno(mf)
+selected = b2mcscf.select_active_space(
+    mol, lo_coeff, lo_occ, ao_labels=['Dy-4f', '3-Cl-3p', '5-Cl-3p'],
+    atom_order=[0, 3, 5, 1]
+)
+lo_coeff, lo_occ, lo_energy, nactorb, nactelec = b2mcscf.sort_orbitals(
+    mol,
+    lo_coeff,
+    lo_occ,
+    lo_energy,
+    cas_list=selected,
+    do_loc=True,
+    split_low=0.1,
+    split_high=1.9,
+)
+
+b2scf.mulliken_pop_dmao(mol, mf.make_rdm1())
+
+pickle.dump((lo_coeff, lo_occ, lo_energy, nactorb, nactelec, dmao), open("%02d-cas-data.bin" % fidx, "wb"))
+
+mf = scf.RHF(mol).x2c()
+mf.mo_coeff = lo_coeff
+mf.mo_occ = np.array([int(np.round(x) + 0.1) for x in lo_occ])
+assert sum(mf.mo_occ) == mol.nelectron
+mf.mo_energy = lo_energy
+
+mc = mcscf.CASCI(mf, nactorb, nactelec)
+ncore = mc.ncore
+ncas = mc.ncas
+print('ncore = ', ncore, ' ncas = ', ncas)
+
+ncas, n_elec, spin, ecore, h1e, g2e, orb_sym = itgsoc.get_rhf_somf_integrals(
+    mf, ncore, ncas, pg_symm=False, dmao=dmao, amfi=True, x2c1e=False, x2c2e=False
+)
+
+driver = DMRGDriver(
+    scratch="/central/scratch/hczhai/soc-04-%02d" % fidx,
+    symm_type=SymmetryTypes.SGFCPX, n_threads=56,
+    stack_mem=int(70E9)
+)
+
+idx = driver.orbital_reordering(np.abs(h1e), np.abs(g2e))
+print('reordering = ', idx)
+h1e = h1e[idx][:, idx]
+g2e = g2e[idx][:, idx][:, :, idx][:, :, :, idx]
+
+shift = -28915.30
+x = (shift - ecore) / n_elec
+h1e -= x * np.identity(len(h1e))
+ecore += x * n_elec
+
+pickle.dump((ncas, n_elec, spin, ecore, h1e, g2e, orb_sym), open("%02d-mf-data.bin" % fidx, "wb"))
+
+txed = time.perf_counter()
+print("MF FINISH TIME = ", datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
+print("MF TIME  = %20.3f" % (txed - txst))
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='hpc-81-07.cm.cluster', release='3.10.0-1160.25.1.el7.x86_64', version='#1 SMP Wed Apr 28 21:49:45 UTC 2021', machine='x86_64', processor='x86_64')  Threads 56
+Python 3.8.5 (default, Sep  4 2020, 07:30:14) 
+[GCC 7.3.0]
+numpy 1.19.4  scipy 1.4.1
+Date: Sat Sep  3 03:53:39 2022
+PySCF version 2.0.1
+PySCF path  /central/groups/changroup/members/hczhai/program/pyscf
+GIT HEAD (branch master) 9d5b5bd309d1cc55fbd1a0ec76e26b5b0c7f76af
+
+[ENV] PYSCF_TMPDIR /central/scratch/hczhai/soc-pyscf-tmp
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 12
+[INPUT] num. electrons = 306
+[INPUT] charge = -4
+[INPUT] spin (= nelec alpha-beta = 2S) = 10
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT]  1 Dy     0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr
+[INPUT]  2 Dy     2.720000000000   2.720000000000   0.000000000000 AA    5.140055058817   5.140055058817   0.000000000000 Bohr
+[INPUT]  3 Cl    -2.720000000000   0.000000000000   0.000000000000 AA   -5.140055058817   0.000000000000   0.000000000000 Bohr
+[INPUT]  4 Cl     2.720000000000   0.000000000000   0.000000000000 AA    5.140055058817   0.000000000000   0.000000000000 Bohr
+[INPUT]  5 Cl     0.000000000000  -2.720000000000   0.000000000000 AA    0.000000000000  -5.140055058817   0.000000000000 Bohr
+[INPUT]  6 Cl     0.000000000000   2.720000000000   0.000000000000 AA    0.000000000000   5.140055058817   0.000000000000 Bohr
+[INPUT]  7 Cl     0.000000000000   0.000000000000  -2.720000000000 AA    0.000000000000   0.000000000000  -5.140055058817 Bohr
+[INPUT]  8 Cl     0.000000000000   0.000000000000   2.720000000000 AA    0.000000000000   0.000000000000   5.140055058817 Bohr
+[INPUT]  9 Cl     2.720000000000   5.440000000000   0.000000000000 AA    5.140055058817  10.280110117634   0.000000000000 Bohr
+[INPUT] 10 Cl     5.440000000000   2.720000000000   0.000000000000 AA   10.280110117634   5.140055058817   0.000000000000 Bohr
+[INPUT] 11 Cl     2.720000000000   2.720000000000  -2.720000000000 AA    5.140055058817   5.140055058817  -5.140055058817 Bohr
+[INPUT] 12 Cl     2.720000000000   2.720000000000   2.720000000000 AA    5.140055058817   5.140055058817   5.140055058817 Bohr
+
+nuclear repulsion = 5580.72180110298
+number of shells = 28
+number of NR pGTOs = 1016
+number of NR cGTOs = 248
+basis = {'Dy': 'ano@7s6p4d2f', 'Cl': 'ano@4s3p'}
+ecp = {}
+CPU time:         1.69
+basis = dz nelec = 306 nao = 248
+Initial guess from the superpostion of atomic densties.
+Spherically averaged atomic HF for {'Dy', 'Cl'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF-RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /central/scratch/hczhai/soc-pyscf-tmp/tmprx5fnbno
+max_memory 100000 MB (current use 129 MB)
+atom = Dy
+Set gradient conv threshold to 3.16228e-05
+init E= -10663.2077249146
+cycle= 1 E= -10690.3316345374  delta_E= -27.1  |g|=    0  |ddm|= 3.86
+cycle= 2 E= -10695.1729678745  delta_E= -4.84  |g|=    0  |ddm|=  4.8
+cycle= 3 E= -10704.9358234951  delta_E= -9.76  |g|=    0  |ddm|= 2.49
+cycle= 4 E= -10704.9544732764  delta_E= -0.0186  |g|=    0  |ddm|= 0.141
+cycle= 5 E= -10704.9567013852  delta_E= -0.00223  |g|=    0  |ddm|= 0.0434
+cycle= 6 E= -10704.9567340953  delta_E= -3.27e-05  |g|=    0  |ddm|= 0.00768
+cycle= 7 E= -10704.9567362389  delta_E= -2.14e-06  |g|=    0  |ddm|= 0.00215
+cycle= 8 E= -10704.9567362799  delta_E= -4.09e-08  |g|=    0  |ddm|= 0.000589
+cycle= 9 E= -10704.95673628  delta_E= -1.22e-10  |g|=    0  |ddm|= 3.23e-05
+Extra cycle  E= -10704.95673628  delta_E= -1.46e-11  |g|=    0  |ddm|= 3.8e-07
+Atomic HF for atom  Dy  converged. SCF energy = -10704.95673628
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF-RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /central/scratch/hczhai/soc-pyscf-tmp/tmp0kswiwgi
+max_memory 100000 MB (current use 153 MB)
+atom = Cl
+Set gradient conv threshold to 3.16228e-05
+init E= -458.887636435305
+cycle= 1 E= -458.888650005697  delta_E= -0.00101  |g|=    0  |ddm|= 0.0495
+cycle= 2 E= -458.888686753694  delta_E= -3.67e-05  |g|=    0  |ddm|= 0.0127
+cycle= 3 E= -458.888689245199  delta_E= -2.49e-06  |g|=    0  |ddm|= 0.00273
+cycle= 4 E= -458.888689258122  delta_E= -1.29e-08  |g|=    0  |ddm|= 0.000175
+cycle= 5 E= -458.88868925833  delta_E= -2.08e-10  |g|=    0  |ddm|= 2.55e-05
+Extra cycle  E= -458.88868925833  delta_E= -2.84e-13  |g|=    0  |ddm|= 1.6e-07
+Atomic HF for atom  Cl  converged. SCF energy = -458.88868925833
+(2, 248, 248)
+NELEC BEFORE = 151.0 151.0
+Spherically averaged atomic HF for {'Dy', 'Cl'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF-RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /central/scratch/hczhai/soc-pyscf-tmp/tmptydribhz
+max_memory 100000 MB (current use 156 MB)
+atom = Dy
+Set gradient conv threshold to 3.16228e-05
+init E= -10663.2077249146
+cycle= 1 E= -10690.3316345374  delta_E= -27.1  |g|=    0  |ddm|= 3.86
+cycle= 2 E= -10695.1729678745  delta_E= -4.84  |g|=    0  |ddm|=  4.8
+cycle= 3 E= -10704.9358234951  delta_E= -9.76  |g|=    0  |ddm|= 2.49
+cycle= 4 E= -10704.9544732764  delta_E= -0.0186  |g|=    0  |ddm|= 0.141
+cycle= 5 E= -10704.9567013852  delta_E= -0.00223  |g|=    0  |ddm|= 0.0434
+cycle= 6 E= -10704.9567340953  delta_E= -3.27e-05  |g|=    0  |ddm|= 0.00768
+cycle= 7 E= -10704.9567362389  delta_E= -2.14e-06  |g|=    0  |ddm|= 0.00215
+cycle= 8 E= -10704.9567362799  delta_E= -4.1e-08  |g|=    0  |ddm|= 0.000589
+cycle= 9 E= -10704.95673628  delta_E= -1.29e-10  |g|=    0  |ddm|= 3.23e-05
+Extra cycle  E= -10704.95673628  delta_E= -1.46e-11  |g|=    0  |ddm|= 3.8e-07
+Atomic HF for atom  Dy  converged. SCF energy = -10704.95673628
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF-RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /central/scratch/hczhai/soc-pyscf-tmp/tmp1g70py5d
+max_memory 100000 MB (current use 237 MB)
+atom = Cl
+Set gradient conv threshold to 3.16228e-05
+init E= -458.887636435305
+cycle= 1 E= -458.888650005697  delta_E= -0.00101  |g|=    0  |ddm|= 0.0495
+cycle= 2 E= -458.888686753693  delta_E= -3.67e-05  |g|=    0  |ddm|= 0.0127
+cycle= 3 E= -458.888689245199  delta_E= -2.49e-06  |g|=    0  |ddm|= 0.00273
+cycle= 4 E= -458.888689258122  delta_E= -1.29e-08  |g|=    0  |ddm|= 0.000175
+cycle= 5 E= -458.88868925833  delta_E= -2.08e-10  |g|=    0  |ddm|= 2.55e-05
+Extra cycle  E= -458.88868925833  delta_E= -2.27e-13  |g|=    0  |ddm|= 1.6e-07
+Atomic HF for atom  Cl  converged. SCF energy = -458.88868925833
+NELEC AFTER  = 156.0 146.0
+
+
+******** <class 'pyscf.x2c.sfx2c1e.sfx2c1e.<locals>.SFX2C1E_SCF'> ********
+method = SFX2C1E_SCF-UKS
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 15
+SCF conv_tol = 1e-10
+SCF conv_tol_grad = None
+SCF max_cycles = 500
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /central/scratch/hczhai/soc-pyscf-tmp/tmp5ps3lhlg
+max_memory 100000 MB (current use 222 MB)
+number electrons alpha = 158  beta = 148
+XC library pyscf.dft.libxc version 5.2.0
+    S. Lehtola, C. Steigemann, M. J. Oliveira, and M. A. Marques, SoftwareX 7, 1 (2018)
+XC functionals = bp86
+    A. D. Becke, Phys. Rev. A 38, 3098 (1988)
+    J. P. Perdew, Phys. Rev. B 33, 8822 (1986)
+radial grids: 
+    Treutler-Ahlrichs [JCP 102, 346 (1995); DOI:10.1063/1.469408] (M4) radial grids
+    
+becke partition: Becke, JCP 88, 2547 (1988); DOI:10.1063/1.454033
+pruning grids: <function nwchem_prune at 0x7fa594aae700>
+grids dens level: 3
+symmetrized grids: False
+atomic radii adjust function: <function treutler_atomic_radii_adjust at 0x7fa594aae670>
+small_rho_cutoff = 1e-07
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+Overwritten attributes  get_occ energy_tot get_grad  of <class 'pyscf.x2c.sfx2c1e.sfx2c1e.<locals>.SFX2C1E_SCF'>
+Set gradient conv threshold to 1e-05
+tot grids = 231104
+init E= -28651.4518443974
+  alpha nocc = 158  HOMO = -0.101595839107882  LUMO = -0.0164679093319723
+
+WARN: beta  nocc = 148  HOMO 0.0375481501507783 >= LUMO 0.0382953151369892
+
+    sigma = 0.2  Optimized mu = [-0.03397329 -0.12841846]  entropy = 97.3317687523
+    Total E(T) = -28921.4188112187  Free energy = -28940.8851649691  E0 = -28931.1519880939
+cycle= 1 E= -28921.4188112187  delta_E= -270  |g|= 9.27  |ddm|= 7.04
+  alpha nocc = 158  HOMO = 0.0548862381758225  LUMO = 0.0563063873798754
+  beta  nocc = 148  HOMO = 0.0145083755716424  LUMO = 0.0277618468556717
+
+WARN: system HOMO 0.0652275122585036 >= system LUMO 0.0277618468556717
+
+    sigma = 0.2  Optimized mu = [ 0.05846253 -0.09494081]  entropy = 75.7905371021
+    Total E(T) = -28776.0184223995  Free energy = -28791.17652982  E0 = -28783.5974761098
+cycle= 2 E= -28776.0184223995  delta_E=  145  |g|= 33.5  |ddm|= 6.37
+  alpha nocc = 158  HOMO = 0.105843427386799  LUMO = 0.237742401307599
+
+WARN: beta  nocc = 148  HOMO 0.0852593092347496 >= LUMO 0.0862554295000618
+
+
+WARN: system HOMO 0.117783411105466 >= system LUMO 0.0862554295000618
+
+    sigma = 0.2  Optimized mu = [0.23362298 0.10296624]  entropy = 85.7059949472
+    Total E(T) = -28884.3629674941  Free energy = -28901.5041664836  E0 = -28892.9335669889
+cycle= 3 E= -28884.3629674941  delta_E= -108  |g|= 17.3  |ddm|= 3.86
+  alpha nocc = 158  HOMO = 0.0843703949910924  LUMO = 0.140194848265082
+  beta  nocc = 148  HOMO = 0.0743150574148099  LUMO = 0.0754140866398784
+
+WARN: system HOMO 0.0964628531201621 >= system LUMO 0.0754140866398784
+
+    sigma = 0.2  Optimized mu = [0.19722136 0.06691571]  entropy = 85.28745111
+    Total E(T) = -28875.8816039176  Free energy = -28892.9390941396  E0 = -28884.4103490286
+cycle= 4 E= -28875.8816039176  delta_E= 8.48  |g|=   19  |ddm|= 0.831
+  alpha nocc = 158  HOMO = 0.117668582486768  LUMO = 0.183280070053402
+  beta  nocc = 148  HOMO = 0.0837491875490024  LUMO = 0.0893200444927123
+
+WARN: system HOMO 0.129431749095978 >= system LUMO 0.0893200444927123
+
+    sigma = 0.2  Optimized mu = [0.2169192  0.08583325]  entropy = 85.02819385
+    Total E(T) = -28877.0413556278  Free energy = -28894.0469943978  E0 = -28885.5441750128
+cycle= 5 E= -28877.0413556278  delta_E= -1.16  |g|= 18.9  |ddm|= 0.68
+  alpha nocc = 158  HOMO = 0.258352734310135  LUMO = 0.264091444080523
+  beta  nocc = 148  HOMO = 0.140957778664865  LUMO = 0.145708629669624
+
+WARN: system HOMO 0.273661341708054 >= system LUMO 0.145708629669624
+
+    sigma = 0.2  Optimized mu = [0.26517412 0.14210833]  entropy = 89.5313710026
+    Total E(T) = -28897.7731278372  Free energy = -28915.6794020377  E0 = -28906.7262649374
+cycle= 6 E= -28897.7731278372  delta_E= -20.7  |g|= 14.3  |ddm|= 1.66
+
+WARN: alpha nocc = 158  HOMO 0.497651452771697 >= LUMO 0.497884281017422
+
+  beta  nocc = 148  HOMO = 0.503960466894276  LUMO = 0.511499578123991
+    sigma = 0.2  Optimized mu = [0.45153327 0.34221198]  entropy = 96.4179067526
+    Total E(T) = -28906.260899123  Free energy = -28925.5444804736  E0 = -28915.9026897983
+cycle= 7 E= -28906.260899123  delta_E= -8.49  |g|= 11.6  |ddm|= 5.42
+  alpha nocc = 158  HOMO = 0.0987482939805841  LUMO = 0.351711218955314
+  beta  nocc = 148  HOMO = 0.0990449748689527  LUMO = 0.101987763835885
+    sigma = 0.2  Optimized mu = [0.30551352 0.19430567]  entropy = 95.7394931505
+    Total E(T) = -28924.5203595142  Free energy = -28943.6682581443  E0 = -28934.0943088292
+cycle= 8 E= -28924.5203595142  delta_E= -18.3  |g|= 5.28  |ddm|= 3.18
+  alpha nocc = 158  HOMO = 0.10556909763349  LUMO = 0.353248373762988
+
+WARN: beta  nocc = 148  HOMO 0.136601786524606 >= LUMO 0.136723502230518
+
+    sigma = 0.2  Optimized mu = [0.31171423 0.20452556]  entropy = 97.8344342876
+    Total E(T) = -28925.8995776346  Free energy = -28945.4664644922  E0 = -28935.6830210634
+cycle= 9 E= -28925.8995776346  delta_E= -1.38  |g|= 2.97  |ddm|= 0.779
+  alpha nocc = 158  HOMO = 0.0990813980187291  LUMO = 0.351538906246041
+
+WARN: beta  nocc = 148  HOMO 0.123987815224214 >= LUMO 0.1242157452894
+
+    sigma = 0.2  Optimized mu = [0.30556855 0.19865728]  entropy = 98.0816906878
+    Total E(T) = -28925.625301235  Free energy = -28945.2416393725  E0 = -28935.4334703037
+cycle= 10 E= -28925.625301235  delta_E= 0.274  |g|= 3.32  |ddm|= 0.693
+  alpha nocc = 158  HOMO = 0.171881921309034  LUMO = 0.36841611994845
+
+WARN: beta  nocc = 148  HOMO 0.20724121040028 >= LUMO 0.207267564256939
+
+    sigma = 0.2  Optimized mu = [0.3349176  0.22916789]  entropy = 98.7834125235
+    Total E(T) = -28926.7836332043  Free energy = -28946.540315709  E0 = -28936.6619744566
+cycle= 11 E= -28926.7836332043  delta_E= -1.16  |g|= 0.207  |ddm|= 0.643
+  alpha nocc = 158  HOMO = 0.166201844037922  LUMO = 0.365593438844825
+
+WARN: beta  nocc = 148  HOMO 0.199268443223504 >= LUMO 0.199874886868413
+
+    sigma = 0.2  Optimized mu = [0.33216097 0.22651749]  entropy = 98.8345648194
+    Total E(T) = -28926.7719003318  Free energy = -28946.5388132957  E0 = -28936.6553568138
+cycle= 12 E= -28926.7719003318  delta_E= 0.0117  |g|= 0.281  |ddm|= 0.102
+  alpha nocc = 158  HOMO = 0.169165179205931  LUMO = 0.365623358784623
+
+WARN: beta  nocc = 148  HOMO 0.197935067067609 >= LUMO 0.198634729365442
+
+    sigma = 0.2  Optimized mu = [0.33235723 0.22672146]  entropy = 98.8381735157
+    Total E(T) = -28926.7687387024  Free energy = -28946.5363734055  E0 = -28936.6525560539
+cycle= 13 E= -28926.7687387024  delta_E= 0.00316  |g|= 0.399  |ddm|= 0.0369
+  alpha nocc = 158  HOMO = 0.170772264223862  LUMO = 0.365945711643731
+
+WARN: beta  nocc = 148  HOMO 0.206157241419491 >= LUMO 0.206211865648219
+
+    sigma = 0.2  Optimized mu = [0.33350127 0.227911  ]  entropy = 98.8595960181
+    Total E(T) = -28926.7764696542  Free energy = -28946.5483888578  E0 = -28936.662429256
+cycle= 14 E= -28926.7764696542  delta_E= -0.00773  |g|= 0.0318  |ddm|= 0.0413
+  alpha nocc = 158  HOMO = 0.171820911571844  LUMO = 0.36628634782859
+
+WARN: beta  nocc = 148  HOMO 0.207222469949094 >= LUMO 0.207252586347462
+
+    sigma = 0.2  Optimized mu = [0.33405332 0.22848138]  entropy = 98.8710638264
+    Total E(T) = -28926.7743275071  Free energy = -28946.5485402724  E0 = -28936.6614338898
+cycle= 15 E= -28926.7743275071  delta_E= 0.00214  |g|= 0.00556  |ddm|= 0.00835
+  alpha nocc = 158  HOMO = 0.17197657430656  LUMO = 0.366365160704266
+
+WARN: beta  nocc = 148  HOMO 0.207375796246637 >= LUMO 0.207408291875751
+
+    sigma = 0.2  Optimized mu = [0.33414592 0.22857588]  entropy = 98.8722810022
+    Total E(T) = -28926.7740881035  Free energy = -28946.548544304  E0 = -28936.6613162037
+cycle= 16 E= -28926.7740881035  delta_E= 0.000239  |g|= 0.00453  |ddm|= 0.00199
+  alpha nocc = 158  HOMO = 0.171945308168098  LUMO = 0.366351111325594
+
+WARN: beta  nocc = 148  HOMO 0.207338251006821 >= LUMO 0.207381823502963
+
+    sigma = 0.2  Optimized mu = [0.33412339 0.22855281]  entropy = 98.8718732931
+    Total E(T) = -28926.7741687032  Free energy = -28946.5485433619  E0 = -28936.6613560325
+cycle= 17 E= -28926.7741687032  delta_E= -8.06e-05  |g|= 0.00734  |ddm|= 0.00108
+  alpha nocc = 158  HOMO = 0.171928598564123  LUMO = 0.366344096464715
+
+WARN: beta  nocc = 148  HOMO 0.207331336580967 >= LUMO 0.207357563339089
+
+    sigma = 0.2  Optimized mu = [0.33411301 0.22854212]  entropy = 98.8716411739
+    Total E(T) = -28926.7742167787  Free energy = -28946.5485450135  E0 = -28936.6613808961
+cycle= 18 E= -28926.7742167787  delta_E= -4.81e-05  |g|= 0.000334  |ddm|= 0.000682
+  alpha nocc = 158  HOMO = 0.171931432819975  LUMO = 0.366344401542848
+
+WARN: beta  nocc = 148  HOMO 0.207334880941776 >= LUMO 0.207361092363718
+
+    sigma = 0.2  Optimized mu = [0.33411434 0.22854363]  entropy = 98.871702254
+    Total E(T) = -28926.7742045656  Free energy = -28946.5485450164  E0 = -28936.661374791
+cycle= 19 E= -28926.7742045656  delta_E= 1.22e-05  |g|= 4.01e-05  |ddm|= 4.34e-05
+  alpha nocc = 158  HOMO = 0.171931405833647  LUMO = 0.366344361348776
+
+WARN: beta  nocc = 148  HOMO 0.207334978201349 >= LUMO 0.207361211314902
+
+    sigma = 0.2  Optimized mu = [0.33411428 0.22854359]  entropy = 98.8717025117
+    Total E(T) = -28926.7742045141  Free energy = -28946.5485450164  E0 = -28936.6613747653
+cycle= 20 E= -28926.7742045141  delta_E= 5.15e-08  |g|= 5.96e-05  |ddm|= 7.51e-06
+  alpha nocc = 158  HOMO = 0.171931398080256  LUMO = 0.366344369439035
+
+WARN: beta  nocc = 148  HOMO 0.207335014105118 >= LUMO 0.20736124712244
+
+    sigma = 0.2  Optimized mu = [0.33411428 0.22854359]  entropy = 98.8717029733
+    Total E(T) = -28926.7742044218  Free energy = -28946.5485450165  E0 = -28936.6613747192
+cycle= 21 E= -28926.7742044218  delta_E= 9.23e-08  |g|= 3.26e-06  |ddm|= 4.25e-06
+  alpha nocc = 158  HOMO = 0.17193146656554  LUMO = 0.366344414885206
+
+WARN: beta  nocc = 148  HOMO 0.207335133872039 >= LUMO 0.207361357670513
+
+    sigma = 0.2  Optimized mu = [0.33411433 0.22854365]  entropy = 98.8717033842
+    Total E(T) = -28926.7742043396  Free energy = -28946.5485450164  E0 = -28936.661374678
+cycle= 22 E= -28926.7742043396  delta_E= 8.23e-08  |g|= 6.58e-06  |ddm|= 1.06e-06
+  alpha nocc = 158  HOMO = 0.171931457575902  LUMO = 0.366344412786081
+
+WARN: beta  nocc = 148  HOMO 0.207335129673282 >= LUMO 0.207361355277059
+
+    sigma = 0.2  Optimized mu = [0.33411433 0.22854365]  entropy = 98.8717033088
+    Total E(T) = -28926.7742043546  Free energy = -28946.5485450164  E0 = -28936.6613746855
+cycle= 23 E= -28926.7742043546  delta_E= -1.51e-08  |g|= 1.51e-06  |ddm|= 3.41e-07
+  alpha nocc = 158  HOMO = 0.171931450875602  LUMO = 0.36634441070934
+
+WARN: beta  nocc = 148  HOMO 0.207335125671496 >= LUMO 0.207361352245467
+
+    sigma = 0.2  Optimized mu = [0.33411433 0.22854365]  entropy = 98.8717032455
+    Total E(T) = -28926.7742043673  Free energy = -28946.5485450164  E0 = -28936.6613746918
+cycle= 24 E= -28926.7742043673  delta_E= -1.26e-08  |g|= 2.34e-06  |ddm|= 1.53e-07
+  alpha nocc = 158  HOMO = 0.171931448395269  LUMO = 0.366344409928844
+
+WARN: beta  nocc = 148  HOMO 0.207335124440279 >= LUMO 0.207361351183121
+
+    sigma = 0.2  Optimized mu = [0.33411433 0.22854364]  entropy = 98.871703228
+    Total E(T) = -28926.7742043708  Free energy = -28946.5485450164  E0 = -28936.6613746936
+cycle= 25 E= -28926.7742043708  delta_E= -3.54e-09  |g|= 1.21e-06  |ddm|= 4.79e-08
+  alpha nocc = 158  HOMO = 0.171931447209303  LUMO = 0.366344409642958
+
+WARN: beta  nocc = 148  HOMO 0.207335123845668 >= LUMO 0.207361350470712
+
+    sigma = 0.2  Optimized mu = [0.33411433 0.22854364]  entropy = 98.871703222
+    Total E(T) = -28926.774204372  Free energy = -28946.5485450164  E0 = -28936.6613746942
+cycle= 26 E= -28926.774204372  delta_E= -1.24e-09  |g|= 3.92e-07  |ddm|= 3.03e-08
+  alpha nocc = 158  HOMO = 0.1719314462289  LUMO = 0.366344409376253
+
+WARN: beta  nocc = 148  HOMO 0.207335123190079 >= LUMO 0.207361349765937
+
+    sigma = 0.2  Optimized mu = [0.33411432 0.22854364]  entropy = 98.8717032174
+    Total E(T) = -28926.7742043729  Free energy = -28946.5485450164  E0 = -28936.6613746947
+cycle= 27 E= -28926.7742043729  delta_E= -8.8e-10  |g|= 1.58e-07  |ddm|= 1.08e-08
+  alpha nocc = 158  HOMO = 0.17193144612292  LUMO = 0.366344409493861
+
+WARN: beta  nocc = 148  HOMO 0.207335123121512 >= LUMO 0.207361349664444
+
+    sigma = 0.2  Optimized mu = [0.33411432 0.22854364]  entropy = 98.8717032235
+    Total E(T) = -28926.7742043717  Free energy = -28946.5485450164  E0 = -28936.6613746941
+cycle= 28 E= -28926.7742043717  delta_E= 1.18e-09  |g|= 5.13e-07  |ddm|= 1.6e-08
+  alpha nocc = 158  HOMO = 0.171931445644757  LUMO = 0.366344409722715
+
+WARN: beta  nocc = 148  HOMO 0.207335122542195 >= LUMO 0.207361348973534
+
+    sigma = 0.2  Optimized mu = [0.33411433 0.22854364]  entropy = 98.8717032379
+    Total E(T) = -28926.7742043688  Free energy = -28946.5485450164  E0 = -28936.6613746926
+cycle= 29 E= -28926.7742043688  delta_E= 2.9e-09  |g|= 3.65e-08  |ddm|= 2.16e-08
+  alpha nocc = 158  HOMO = 0.171931443862131  LUMO = 0.366344409279562
+
+WARN: beta  nocc = 148  HOMO 0.207335120336754 >= LUMO 0.207361346797633
+
+    sigma = 0.2  Optimized mu = [0.33411432 0.22854364]  entropy = 98.8717032201
+    Total E(T) = -28926.7742043724  Free energy = -28946.5485450164  E0 = -28936.6613746944
+cycle= 30 E= -28926.7742043724  delta_E= -3.56e-09  |g|= 1.14e-07  |ddm|= 1.57e-08
+  alpha nocc = 158  HOMO = 0.171931444387376  LUMO = 0.366344409296956
+
+WARN: beta  nocc = 148  HOMO 0.207335121000247 >= LUMO 0.207361347442556
+
+    sigma = 0.2  Optimized mu = [0.33411432 0.22854364]  entropy = 98.8717032202
+    Total E(T) = -28926.7742043723  Free energy = -28946.5485450164  E0 = -28936.6613746944
+cycle= 31 E= -28926.7742043723  delta_E= 5.82e-11  |g|= 8.76e-08  |ddm|= 4.98e-09
+  alpha nocc = 158  HOMO = 0.171931461186945  LUMO = 0.366344410708563
+
+WARN: beta  nocc = 148  HOMO 0.207335139054758 >= LUMO 0.207361365325337
+
+    sigma = 0.2  Optimized mu = [0.33411433 0.22854365]  entropy = 98.8717033677
+    Total E(T) = -28926.7742043429  Free energy = -28946.5485450164  E0 = -28936.6613746796
+Extra cycle  E= -28926.7742043429  delta_E= 2.95e-08  |g|= 1.64e-06  |ddm|= 1.32e-07
+converged SCF energy = -28926.7742043429  <S^2> = 3.126388e-13  2S+1 = 1
+Nalpha = 158, Nbeta 148, Sz = 10, Norb = 248
+Idemponency of DM: 0.7905694160618367
+active orbital indices [148 149 150 151 152 153 154 155 156 157]
+Num active orbitals 10
+core orbs: (248, 148)
+act  orbs: (248, 10)
+vir  orbs: (248, 90)
+
+[pm_loc_kernel]
+ mocoeff.shape= (248, 148)
+ tol= 1e-06
+ maxcycle= 1000
+ partition= 12 \n [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58], [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117], [118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130], [131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143], [144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156], [157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169], [170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182], [183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195], [196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208], [209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221], [222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234], [235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247]]
+ initial funval =  31.51134448930082
+icycle= 0 delta= 52.135689574234156 fun= 83.64703406353497
+icycle= 1 delta= 39.62077321906964 fun= 123.26780728260462
+icycle= 2 delta= 17.077683741870693 fun= 140.3454910244753
+icycle= 3 delta= 3.7904305146814865 fun= 144.13592153915678
+icycle= 4 delta= 0.5674984541239383 fun= 144.70341999328073
+icycle= 5 delta= 0.07651845112677537 fun= 144.77993844440752
+icycle= 6 delta= 0.013441734097435855 fun= 144.79338017850495
+icycle= 7 delta= 0.0033961053377633403 fun= 144.79677628384272
+icycle= 8 delta= 0.0007180672851997982 fun= 144.7974943511279
+icycle= 9 delta= 0.00015771960566873458 fun= 144.7976520707336
+icycle= 10 delta= 1.8741447596657992e-05 fun= 144.7976708121812
+icycle= 11 delta= 2.1272042382840665e-06 fun= 144.79767293938542
+icycle= 12 delta= 3.7124928960639015e-07 fun= 144.7976733106347
+CONG: PMloc converged!
+
+[pm_loc_kernel]
+ mocoeff.shape= (248, 10)
+ tol= 1e-06
+ maxcycle= 1000
+ partition= 12 \n [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58], [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117], [118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130], [131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143], [144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156], [157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169], [170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182], [183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195], [196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208], [209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221], [222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234], [235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247]]
+ initial funval =  5.7862112488570325
+icycle= 0 delta= 1.8838235629299036 fun= 7.670034811786936
+icycle= 1 delta= 0.19276924544834906 fun= 7.862804057235285
+icycle= 2 delta= 0.007709633740194692 fun= 7.870513690975479
+icycle= 3 delta= 0.00012097697720483882 fun= 7.870634667952684
+icycle= 4 delta= 1.5921988751216496e-07 fun= 7.870634827172572
+CONG: PMloc converged!
+\nLowdin population for LMOs:
+[C   0] occ =  2.00000 fii =   -236.915 (  1-Dy-     2s = 0.632) (  1-Dy-     3s = 0.147) (  1-Dy-    3pz = 0.053) 
+[C   1] occ =  2.00000 fii =   -322.168 (  0-Dy-     2s = 0.210) (  0-Dy-    2px = 0.184) (  0-Dy-   3dxz = 0.094) 
+[C   2] occ =  2.00000 fii =   -446.868 (  1-Dy-    2px = 0.397) (  1-Dy-   3dxz = 0.197) (  1-Dy-     1s = 0.148) 
+[C   3] occ =  2.00000 fii =   -498.535 (  0-Dy-    2py = 0.309) (  0-Dy-     1s = 0.193) (  0-Dy-3dx2-y2 = 0.140) 
+[C   4] occ =  2.00000 fii =   -122.336 (  1-Dy-  3dz^2 = 0.242) (  1-Dy-    3py = 0.160) (  1-Dy-     2s = 0.129) 
+[C   5] occ =  2.00000 fii =   -271.036 (  1-Dy-   3dxy = 0.248) (  1-Dy-    3py = 0.174) (  1-Dy-    2py = 0.141) 
+[C   6] occ =  2.00000 fii =   -235.298 (  1-Dy-    3px = 0.279) (  1-Dy-   3dxy = 0.119) (  1-Dy-   3dxz = 0.100) 
+[C   7] occ =  2.00000 fii =   -363.537 (  1-Dy-   3dyz = 0.344) (  1-Dy-   3dxz = 0.150) (  1-Dy-     1s = 0.147) 
+[C   8] occ =  2.00000 fii =   -146.351 (  0-Dy-     2s = 0.313) (  0-Dy-   3dyz = 0.166) (  0-Dy-    3px = 0.138) 
+[C   9] occ =  2.00000 fii =   -130.962 (  1-Dy-     3s = 0.231) (  1-Dy-    3px = 0.208) (  1-Dy-    2py = 0.173) 
+[C  10] occ =  2.00000 fii =   -314.527 (  1-Dy-3dx2-y2 = 0.270) (  1-Dy-    3py = 0.175) (  1-Dy-    2px = 0.164) 
+[C  11] occ =  2.00000 fii =   -219.639 (  0-Dy-   3dxz = 0.256) (  0-Dy-   3dxy = 0.178) (  0-Dy-    2pz = 0.120) 
+[C  12] occ =  2.00000 fii =   -395.505 (  1-Dy-    2pz = 0.286) (  1-Dy-    2py = 0.221) (  1-Dy-   3dxy = 0.177) 
+[C  13] occ =  2.00000 fii =     -7.831 (  9-Cl-    2pz = 0.812) (  9-Cl-    2py = 0.161) (  9-Cl-    2px = 0.014) 
+[C  14] occ =  2.00000 fii =     -6.672 (  6-Cl-    2py = 0.956) (  6-Cl-    2px = 0.040) (  6-Cl-    2pz = 0.001) 
+[C  15] occ =  2.00000 fii =   -288.850 (  1-Dy-    2pz = 0.235) (  1-Dy-  3dz^2 = 0.139) (  1-Dy-   3dxz = 0.122) 
+[C  16] occ =  2.00000 fii =     -6.724 (  7-Cl-    2px = 0.842) (  7-Cl-    2py = 0.112) (  7-Cl-    2pz = 0.045) 
+[C  17] occ =  2.00000 fii =     -9.077 (  4-Cl-    2pz = 0.664) (  4-Cl-    2px = 0.263) (  4-Cl-    2py = 0.046) 
+[C  18] occ =  2.00000 fii =   -132.521 (  1-Dy-   3dyz = 0.238) (  1-Dy-  3dz^2 = 0.236) (  1-Dy-    2pz = 0.158) 
+[C  19] occ =  2.00000 fii =   -141.779 (  1-Dy-3dx2-y2 = 0.452) (  1-Dy-   3dxz = 0.107) (  1-Dy-     3s = 0.080) 
+[C  20] occ =  2.00000 fii =    -82.493 (  0-Dy-    3pz = 0.209) (  0-Dy-     3s = 0.193) (  0-Dy-  3dz^2 = 0.155) 
+[C  21] occ =  2.00000 fii =    -30.319 (  2-Cl-    2pz = 0.559) (  2-Cl-     1s = 0.252) (  2-Cl-    2py = 0.135) 
+[C  22] occ =  2.00000 fii =    -21.565 ( 10-Cl-    2px = 0.702) ( 10-Cl-     1s = 0.158) ( 10-Cl-    2py = 0.135) 
+[C  23] occ =  2.00000 fii =    -20.642 (  8-Cl-    2pz = 0.511) (  8-Cl-    2px = 0.321) (  8-Cl-     1s = 0.149) 
+[C  24] occ =  2.00000 fii =    -14.095 (  7-Cl-    2py = 0.785) (  7-Cl-     1s = 0.079) (  7-Cl-    2pz = 0.067) 
+[C  25] occ =  2.00000 fii =    -32.259 ( 10-Cl-    2py = 0.710) ( 10-Cl-     1s = 0.272) ( 10-Cl-    2px = 0.014) 
+[C  26] occ =  2.00000 fii =    -10.677 ( 11-Cl-    2py = 0.824) ( 11-Cl-    2px = 0.122) ( 11-Cl-     1s = 0.043) 
+[C  27] occ =  2.00000 fii =   -288.515 (  0-Dy-     2s = 0.299) (  0-Dy-    2px = 0.190) (  0-Dy-    2pz = 0.161) 
+[C  28] occ =  2.00000 fii =    -66.786 ( 11-Cl-     1s = 0.639) ( 11-Cl-    2pz = 0.317) ( 11-Cl-    2py = 0.030) 
+[C  29] occ =  2.00000 fii =    -58.736 (  6-Cl-     1s = 0.554) (  6-Cl-    2px = 0.419) (  6-Cl-    2py = 0.016) 
+[C  30] occ =  2.00000 fii =   -201.415 (  0-Dy-    2py = 0.333) (  0-Dy-   3dxy = 0.216) (  0-Dy-    3py = 0.077) 
+[C  31] occ =  2.00000 fii =     -7.741 (  3-Cl-    2pz = 0.987) (  3-Cl-     1s = 0.011) (  3-Cl-    2py = 0.001) 
+[C  32] occ =  2.00000 fii =     -7.079 (  2-Cl-    2py = 0.572) (  2-Cl-    2pz = 0.281) (  2-Cl-    2px = 0.138) 
+[C  33] occ =  2.00000 fii =    -30.405 (  2-Cl-    2px = 0.387) (  2-Cl-    2py = 0.289) (  2-Cl-     1s = 0.252) 
+[C  34] occ =  2.00000 fii =    -79.370 (  7-Cl-     1s = 0.773) (  7-Cl-    2py = 0.095) (  7-Cl-    2pz = 0.088) 
+[C  35] occ =  2.00000 fii =    -67.270 (  0-Dy-   3dxy = 0.306) (  0-Dy-   3dxz = 0.248) (  0-Dy-    3py = 0.123) 
+[C  36] occ =  2.00000 fii =    -27.503 (  5-Cl-    2pz = 0.720) (  5-Cl-     1s = 0.222) (  5-Cl-    2py = 0.056) 
+[C  37] occ =  2.00000 fii =   -101.230 (  0-Dy-    3py = 0.168) (  0-Dy-  3dz^2 = 0.140) (  0-Dy-   3dxz = 0.126) 
+[C  38] occ =  2.00000 fii =    -21.907 (  1-Dy-     4s = 0.827) (  1-Dy-     3s = 0.115) (  1-Dy-  4dz^2 = 0.029) 
+[C  39] occ =  2.00000 fii =    -22.023 (  0-Dy-     4s = 0.826) (  0-Dy-     3s = 0.116) (  0-Dy-  4dz^2 = 0.029) 
+[C  40] occ =  2.00000 fii =    -19.307 (  6-Cl-    2pz = 0.591) (  6-Cl-    2px = 0.266) (  6-Cl-     1s = 0.134) 
+[C  41] occ =  2.00000 fii =    -25.673 (  9-Cl-    2px = 0.601) (  9-Cl-     1s = 0.202) (  9-Cl-    2py = 0.193) 
+[C  42] occ =  2.00000 fii =   -147.857 (  0-Dy-  3dz^2 = 0.264) (  0-Dy-3dx2-y2 = 0.206) (  0-Dy-    2pz = 0.123) 
+[C  43] occ =  2.00000 fii =    -11.193 ( 11-Cl-    2px = 0.488) ( 11-Cl-    2pz = 0.322) ( 11-Cl-    2py = 0.139) 
+[C  44] occ =  2.00000 fii =    -73.463 (  8-Cl-     1s = 0.710) (  8-Cl-    2pz = 0.264) (  8-Cl-    2py = 0.016) 
+[C  45] occ =  2.00000 fii =    -60.762 (  4-Cl-     1s = 0.575) (  4-Cl-    2px = 0.222) (  4-Cl-    2pz = 0.195) 
+[C  46] occ =  2.00000 fii =    -77.996 (  5-Cl-     1s = 0.758) (  5-Cl-    2pz = 0.219) (  5-Cl-     2s = 0.014) 
+[C  47] occ =  2.00000 fii =    -90.517 (  0-Dy-     3s = 0.389) (  0-Dy-  3dz^2 = 0.164) (  0-Dy-3dx2-y2 = 0.082) 
+[C  48] occ =  2.00000 fii =     -8.131 (  8-Cl-    2py = 0.482) (  8-Cl-    2px = 0.395) (  8-Cl-    2pz = 0.096) 
+[C  49] occ =  2.00000 fii =    -17.912 (  1-Dy-    4py = 0.525) (  1-Dy-    4px = 0.330) (  1-Dy-    3py = 0.088) 
+[C  50] occ =  2.00000 fii =    -17.884 (  0-Dy-    4px = 0.646) (  0-Dy-    4py = 0.172) (  0-Dy-    3px = 0.105) 
+[C  51] occ =  2.00000 fii =    -18.770 (  1-Dy-    4px = 0.508) (  1-Dy-    4py = 0.315) (  1-Dy-    3px = 0.093) 
+[C  52] occ =  2.00000 fii =    -18.683 (  0-Dy-    4py = 0.652) (  0-Dy-    4px = 0.173) (  0-Dy-    3py = 0.118) 
+[C  53] occ =  2.00000 fii =    -62.340 (  9-Cl-     1s = 0.592) (  9-Cl-    2py = 0.283) (  9-Cl-    2pz = 0.099) 
+[C  54] occ =  2.00000 fii =    -17.514 (  0-Dy-    4pz = 0.825) (  0-Dy-    3pz = 0.130) (  0-Dy-    4px = 0.026) 
+[C  55] occ =  2.00000 fii =    -17.498 (  1-Dy-    4pz = 0.863) (  1-Dy-    3pz = 0.136) (  1-Dy-    5pz = 0.001) 
+[C  56] occ =  2.00000 fii =    -59.032 (  3-Cl-     1s = 0.557) (  3-Cl-    2px = 0.333) (  3-Cl-    2py = 0.099) 
+[C  57] occ =  2.00000 fii =    -10.856 (  4-Cl-    2py = 0.808) (  4-Cl-    2px = 0.134) (  4-Cl-     1s = 0.045) 
+[C  58] occ =  2.00000 fii =   -392.333 (  1-Dy-    3pz = 0.280) (  1-Dy-     1s = 0.171) (  1-Dy-   3dyz = 0.086) 
+[C  59] occ =  2.00000 fii =    -40.081 (  3-Cl-    2py = 0.463) (  3-Cl-     1s = 0.355) (  3-Cl-    2px = 0.173) 
+[C  60] occ =  2.00000 fii =    -55.517 ( 10-Cl-     1s = 0.519) ( 10-Cl-    2px = 0.280) ( 10-Cl-    2py = 0.149) 
+[C  61] occ =  2.00000 fii =    -10.120 ( 10-Cl-    2pz = 0.949) ( 10-Cl-     1s = 0.037) ( 10-Cl-     2s = 0.009) 
+[C  62] occ =  2.00000 fii =    -38.540 (  4-Cl-    2px = 0.381) (  4-Cl-     1s = 0.339) (  4-Cl-    2pz = 0.137) 
+[C  63] occ =  2.00000 fii =   -168.429 (  0-Dy-    2px = 0.293) (  0-Dy-    3py = 0.122) (  0-Dy-    3pz = 0.099) 
+[C  64] occ =  2.00000 fii =    -17.000 (  8-Cl-    2py = 0.462) (  8-Cl-    2px = 0.281) (  8-Cl-    2pz = 0.129) 
+[C  65] occ =  2.00000 fii =   -109.375 (  1-Dy-     3s = 0.200) (  1-Dy-   3dyz = 0.185) (  1-Dy-   3dxy = 0.144) 
+[C  66] occ =  2.00000 fii =     -6.818 (  5-Cl-    2px = 0.826) (  5-Cl-    2py = 0.152) (  5-Cl-    2pz = 0.016) 
+[C  67] occ =  2.00000 fii =    -23.392 (  9-Cl-    2py = 0.362) (  9-Cl-    2px = 0.348) (  9-Cl-     1s = 0.178) 
+[C  68] occ =  2.00000 fii =     -6.735 (  5-Cl-    2py = 0.770) (  5-Cl-    2px = 0.156) (  5-Cl-    2pz = 0.045) 
+[C  69] occ =  2.00000 fii =    -30.804 ( 11-Cl-    2px = 0.374) ( 11-Cl-    2pz = 0.336) ( 11-Cl-     1s = 0.256) 
+[C  70] occ =  2.00000 fii =    -34.746 (  6-Cl-    2pz = 0.381) (  6-Cl-     1s = 0.298) (  6-Cl-    2px = 0.271) 
+[C  71] occ =  2.00000 fii =    -12.197 (  3-Cl-    2px = 0.477) (  3-Cl-    2py = 0.421) (  3-Cl-     1s = 0.058) 
+[C  72] occ =  2.00000 fii =    -19.271 (  7-Cl-    2pz = 0.783) (  7-Cl-     1s = 0.134) (  7-Cl-    2px = 0.047) 
+[C  73] occ =  2.00000 fii =    -51.432 (  2-Cl-     1s = 0.476) (  2-Cl-    2px = 0.398) (  2-Cl-    2pz = 0.089) 
+[C  74] occ =  2.00000 fii =   -839.623 (  0-Dy-     1s = 0.381) (  0-Dy-    2pz = 0.215) (  0-Dy-   4dxz = 0.105) 
+[C  75] occ =  2.00000 fii =    -83.673 (  0-Dy-   4dxy = 0.204) (  0-Dy-   3dyz = 0.202) (  0-Dy-    3px = 0.168) 
+[C  76] occ =  2.00000 fii =   -105.936 (  0-Dy-   4dxy = 0.519) (  0-Dy-    3pz = 0.137) (  0-Dy-    2pz = 0.083) 
+[C  77] occ =  2.00000 fii =   -270.188 (  0-Dy-   4dyz = 0.362) (  0-Dy-   4dxz = 0.352) (  0-Dy-     1s = 0.118) 
+[C  78] occ =  2.00000 fii =    -41.435 (  1-Dy-   4dyz = 0.430) (  1-Dy-   4dxz = 0.330) (  1-Dy-     3s = 0.054) 
+[C  79] occ =  2.00000 fii =     -8.720 (  0-Dy-   4dxz = 0.482) (  0-Dy-   4dyz = 0.452) (  0-Dy-   3dyz = 0.016) 
+[C  80] occ =  2.00000 fii =     -6.473 (  0-Dy-  4dz^2 = 0.951) (  0-Dy-     4s = 0.023) (  0-Dy-  3dz^2 = 0.014) 
+[C  81] occ =  2.00000 fii =     -6.460 (  1-Dy-  4dz^2 = 0.950) (  1-Dy-     4s = 0.022) (  1-Dy-  3dz^2 = 0.014) 
+[C  82] occ =  2.00000 fii =     -9.830 (  1-Dy-   4dxz = 0.512) (  1-Dy-   4dyz = 0.413) (  1-Dy-   3dxz = 0.021) 
+[C  83] occ =  2.00000 fii =     -6.322 (  0-Dy-4dx2-y2 = 0.981) (  0-Dy-3dx2-y2 = 0.016) (  0-Dy-   4dxy = 0.001) 
+[C  84] occ =  2.00000 fii =     -6.126 (  1-Dy-4dx2-y2 = 0.970) (  1-Dy-3dx2-y2 = 0.014) (  1-Dy-   4dxz = 0.008) 
+[C  85] occ =  2.00000 fii =     -9.681 (  1-Dy-   4dxy = 0.918) (  1-Dy-   3dxy = 0.042) (  1-Dy-3dx2-y2 = 0.010) 
+[C  86] occ =  2.00000 fii =     -7.508 (  5-Cl-     2s = 0.614) (  5-Cl-     3s = 0.270) (  5-Cl-    3py = 0.028) 
+[C  87] occ =  2.00000 fii =     -7.508 (  3-Cl-     2s = 0.614) (  3-Cl-     3s = 0.270) (  3-Cl-    3px = 0.028) 
+[C  88] occ =  2.00000 fii =     -0.507 (  1-Dy-    5px = 0.948) (  5-Cl-    4px = 0.011) (  1-Dy-    6px = 0.008) 
+[C  89] occ =  2.00000 fii =     -0.507 (  0-Dy-    5px = 0.948) (  3-Cl-    4px = 0.011) (  0-Dy-    6px = 0.008) 
+[C  90] occ =  2.00000 fii =     -0.507 (  1-Dy-    5py = 0.948) (  3-Cl-    4py = 0.011) (  1-Dy-    6py = 0.008) 
+[C  91] occ =  2.00000 fii =     -0.507 (  0-Dy-    5py = 0.948) (  5-Cl-    4py = 0.011) (  0-Dy-    6py = 0.008) 
+[C  92] occ =  2.00000 fii =     -0.495 (  1-Dy-    5pz = 0.958) ( 10-Cl-    4pz = 0.008) ( 11-Cl-    4pz = 0.008) 
+[C  93] occ =  2.00000 fii =     -0.495 (  0-Dy-    5pz = 0.958) (  6-Cl-    4pz = 0.008) (  7-Cl-    4pz = 0.008) 
+[C  94] occ =  2.00000 fii =     -1.397 (  1-Dy-     5s = 0.878) (  1-Dy-     6s = 0.029) (  8-Cl-    4py = 0.011) 
+[C  95] occ =  2.00000 fii =     -1.397 (  0-Dy-     5s = 0.878) (  0-Dy-     6s = 0.029) (  4-Cl-    4py = 0.011) 
+[C  96] occ =  2.00000 fii =     -5.942 (  4-Cl-     2s = 0.474) (  4-Cl-     3s = 0.404) (  4-Cl-    3py = 0.076) 
+[C  97] occ =  2.00000 fii =     -5.943 (  2-Cl-     2s = 0.474) (  2-Cl-     3s = 0.404) (  2-Cl-    3px = 0.076) 
+[C  98] occ =  2.00000 fii =     -5.942 (  8-Cl-     2s = 0.474) (  8-Cl-     3s = 0.404) (  8-Cl-    3py = 0.076) 
+[C  99] occ =  2.00000 fii =     -5.942 (  9-Cl-     2s = 0.474) (  9-Cl-     3s = 0.404) (  9-Cl-    3px = 0.076) 
+[C 100] occ =  2.00000 fii =     -6.258 ( 11-Cl-     2s = 0.649) ( 11-Cl-     3s = 0.170) ( 11-Cl-    3pz = 0.146) 
+[C 101] occ =  2.00000 fii =     -6.258 ( 10-Cl-     2s = 0.649) ( 10-Cl-     3s = 0.170) ( 10-Cl-    3pz = 0.146) 
+[C 102] occ =  2.00000 fii =     -6.258 (  6-Cl-     2s = 0.649) (  6-Cl-     3s = 0.170) (  6-Cl-    3pz = 0.146) 
+[C 103] occ =  2.00000 fii =     -6.258 (  7-Cl-     2s = 0.649) (  7-Cl-     3s = 0.170) (  7-Cl-    3pz = 0.146) 
+[C 104] occ =  2.00000 fii =     -3.989 (  6-Cl-     3s = 0.536) (  6-Cl-     2s = 0.298) (  6-Cl-    3pz = 0.118) 
+[C 105] occ =  2.00000 fii =     -3.989 (  7-Cl-     3s = 0.536) (  7-Cl-     2s = 0.298) (  7-Cl-    3pz = 0.118) 
+[C 106] occ =  2.00000 fii =     -3.989 ( 10-Cl-     3s = 0.536) ( 10-Cl-     2s = 0.298) ( 10-Cl-    3pz = 0.118) 
+[C 107] occ =  2.00000 fii =     -3.989 ( 11-Cl-     3s = 0.536) ( 11-Cl-     2s = 0.298) ( 11-Cl-    3pz = 0.118) 
+[C 108] occ =  2.00000 fii =     -4.494 (  8-Cl-     2s = 0.468) (  8-Cl-     3s = 0.285) (  8-Cl-    3py = 0.211) 
+[C 109] occ =  2.00000 fii =     -4.494 (  2-Cl-     2s = 0.468) (  2-Cl-     3s = 0.285) (  2-Cl-    3px = 0.211) 
+[C 110] occ =  2.00000 fii =     -4.493 (  9-Cl-     2s = 0.468) (  9-Cl-     3s = 0.285) (  9-Cl-    3px = 0.211) 
+[C 111] occ =  2.00000 fii =     -4.493 (  4-Cl-     2s = 0.468) (  4-Cl-     3s = 0.285) (  4-Cl-    3py = 0.211) 
+[C 112] occ =  2.00000 fii =     -3.078 (  3-Cl-     3s = 0.312) (  3-Cl-     2s = 0.309) (  3-Cl-    3px = 0.153) 
+[C 113] occ =  2.00000 fii =     -3.078 (  5-Cl-     3s = 0.312) (  5-Cl-     2s = 0.309) (  5-Cl-    3px = 0.153) 
+[C 114] occ =  1.99999 fii =      0.188 (  1-Dy-   4f 2 = 0.500) (  0-Dy-   4f 2 = 0.500) (  1-Dy-   5f 2 = 0.000) 
+[C 115] occ =  1.99999 fii =     -0.232 (  6-Cl-    3pz = 0.645) (  6-Cl-     3s = 0.166) (  0-Dy-    6pz = 0.048) 
+[C 116] occ =  1.99999 fii =     -0.232 (  7-Cl-    3pz = 0.645) (  7-Cl-     3s = 0.166) (  0-Dy-    6pz = 0.048) 
+[C 117] occ =  1.99999 fii =     -0.231 ( 10-Cl-    3pz = 0.645) ( 10-Cl-     3s = 0.166) (  1-Dy-    6pz = 0.048) 
+[C 118] occ =  1.99999 fii =     -0.232 ( 11-Cl-    3pz = 0.645) ( 11-Cl-     3s = 0.166) (  1-Dy-    6pz = 0.048) 
+[C 119] occ =  1.99999 fii =     -0.262 (  4-Cl-    3py = 0.627) (  4-Cl-     3s = 0.183) (  0-Dy-    6py = 0.049) 
+[C 120] occ =  1.99999 fii =     -0.262 (  9-Cl-    3px = 0.627) (  9-Cl-     3s = 0.183) (  1-Dy-    6px = 0.049) 
+[C 121] occ =  1.99999 fii =     -0.262 (  8-Cl-    3py = 0.627) (  8-Cl-     3s = 0.183) (  1-Dy-    6py = 0.049) 
+[C 122] occ =  1.99999 fii =     -0.262 (  2-Cl-    3px = 0.627) (  2-Cl-     3s = 0.183) (  0-Dy-    6px = 0.049) 
+[C 123] occ =  1.99999 fii =      0.189 (  1-Dy-   4f-2 = 0.487) (  0-Dy-   4f-2 = 0.487) (  0-Dy-   4f 0 = 0.013) 
+[C 124] occ =  1.99999 fii =     -0.154 (  3-Cl-    3px = 0.687) (  3-Cl-     3s = 0.109) (  0-Dy-    6px = 0.043) 
+[C 125] occ =  1.99999 fii =     -0.154 (  5-Cl-    3py = 0.687) (  5-Cl-     3s = 0.109) (  0-Dy-    6py = 0.043) 
+[C 126] occ =  1.99999 fii =     -0.154 (  5-Cl-    3px = 0.687) (  5-Cl-     3s = 0.109) (  1-Dy-    6px = 0.043) 
+[C 127] occ =  1.99999 fii =     -0.154 (  3-Cl-    3py = 0.687) (  3-Cl-     3s = 0.109) (  1-Dy-    6py = 0.043) 
+[C 128] occ =  1.99999 fii =      0.188 (  1-Dy-   4f 3 = 0.222) (  0-Dy-   4f 3 = 0.222) (  1-Dy-   4f-3 = 0.222) 
+[C 129] occ =  1.99999 fii =      0.188 (  1-Dy-   4f-3 = 0.217) (  0-Dy-   4f-3 = 0.217) (  1-Dy-   4f 3 = 0.217) 
+[C 130] occ =  1.99999 fii =      0.055 (  5-Cl-    3pz = 0.934) (  0-Dy-   6dyz = 0.009) (  1-Dy-   6dxz = 0.009) 
+[C 131] occ =  1.99999 fii =      0.055 (  3-Cl-    3pz = 0.934) (  0-Dy-   6dxz = 0.009) (  1-Dy-   6dyz = 0.009) 
+[C 132] occ =  1.99999 fii =      0.058 (  7-Cl-    3py = 0.959) (  0-Dy-   6dyz = 0.009) (  0-Dy-   5dyz = 0.008) 
+[C 133] occ =  1.99999 fii =      0.058 (  6-Cl-    3px = 0.959) (  0-Dy-   6dxz = 0.009) (  0-Dy-   5dxz = 0.008) 
+[C 134] occ =  1.99999 fii =      0.058 (  7-Cl-    3px = 0.959) (  0-Dy-   6dxz = 0.009) (  0-Dy-   5dxz = 0.008) 
+[C 135] occ =  1.99999 fii =      0.058 ( 11-Cl-    3px = 0.959) (  1-Dy-   6dxz = 0.009) (  1-Dy-   5dxz = 0.008) 
+[C 136] occ =  1.99999 fii =      0.058 (  6-Cl-    3py = 0.959) (  0-Dy-   6dyz = 0.009) (  0-Dy-   5dyz = 0.008) 
+[C 137] occ =  1.99999 fii =      0.058 ( 10-Cl-    3py = 0.959) (  1-Dy-   6dyz = 0.009) (  1-Dy-   5dyz = 0.008) 
+[C 138] occ =  1.99999 fii =      0.058 ( 10-Cl-    3px = 0.959) (  1-Dy-   6dxz = 0.009) (  1-Dy-   5dxz = 0.008) 
+[C 139] occ =  1.99999 fii =      0.058 ( 11-Cl-    3py = 0.959) (  1-Dy-   6dyz = 0.009) (  1-Dy-   5dyz = 0.008) 
+[C 140] occ =  1.99999 fii =      0.056 (  8-Cl-    3px = 0.963) (  1-Dy-   6dxy = 0.010) (  1-Dy-   5dxy = 0.008) 
+[C 141] occ =  1.99999 fii =      0.056 (  4-Cl-    3px = 0.963) (  0-Dy-   6dxy = 0.010) (  0-Dy-   5dxy = 0.008) 
+[C 142] occ =  1.99999 fii =      0.056 (  9-Cl-    3py = 0.963) (  1-Dy-   6dxy = 0.010) (  1-Dy-   5dxy = 0.008) 
+[C 143] occ =  1.99999 fii =      0.056 (  2-Cl-    3py = 0.963) (  0-Dy-   6dxy = 0.010) (  0-Dy-   5dxy = 0.008) 
+[C 144] occ =  1.99999 fii =      0.055 (  8-Cl-    3pz = 0.965) (  1-Dy-   6dyz = 0.010) (  1-Dy-   5dyz = 0.008) 
+[C 145] occ =  1.99999 fii =      0.056 (  9-Cl-    3pz = 0.965) (  1-Dy-   6dxz = 0.010) (  1-Dy-   5dxz = 0.008) 
+[C 146] occ =  1.99999 fii =      0.055 (  4-Cl-    3pz = 0.965) (  0-Dy-   6dyz = 0.010) (  0-Dy-   5dyz = 0.008) 
+[C 147] occ =  1.99999 fii =      0.056 (  2-Cl-    3pz = 0.965) (  0-Dy-   6dxz = 0.010) (  0-Dy-   5dxz = 0.008) 
+[A 148] occ =  1.00000 fii =      0.189 (  0-Dy-   4f-2 = 0.486) (  1-Dy-   4f-2 = 0.486) (  0-Dy-   4f 0 = 0.013) 
+[A 149] occ =  1.00000 fii =      0.190 (  0-Dy-   4f 3 = 0.216) (  1-Dy-   4f 3 = 0.216) (  0-Dy-   4f-3 = 0.215) 
+[A 150] occ =  1.00000 fii =      0.189 (  0-Dy-   4f-1 = 0.872) (  0-Dy-   4f-3 = 0.117) (  4-Cl-    3py = 0.003) 
+[A 151] occ =  1.00000 fii =      0.189 (  0-Dy-   4f-3 = 0.221) (  1-Dy-   4f-3 = 0.221) (  0-Dy-   4f 3 = 0.220) 
+[A 152] occ =  1.00000 fii =      0.190 (  1-Dy-   4f 0 = 0.961) (  1-Dy-   4f-2 = 0.026) ( 11-Cl-    3pz = 0.004) 
+[A 153] occ =  1.00000 fii =      0.189 (  0-Dy-   4f 1 = 0.872) (  0-Dy-   4f 3 = 0.117) (  2-Cl-    3px = 0.003) 
+[A 154] occ =  1.00000 fii =      0.189 (  1-Dy-   4f-1 = 0.872) (  1-Dy-   4f-3 = 0.117) (  8-Cl-    3py = 0.003) 
+[A 155] occ =  1.00000 fii =      0.190 (  0-Dy-   4f 0 = 0.961) (  0-Dy-   4f-2 = 0.026) (  7-Cl-    3pz = 0.004) 
+[A 156] occ =  1.00000 fii =      0.189 (  0-Dy-   4f 2 = 0.497) (  1-Dy-   4f 2 = 0.497) (  3-Cl-    3pz = 0.001) 
+[A 157] occ =  1.00000 fii =      0.189 (  1-Dy-   4f 1 = 0.872) (  1-Dy-   4f 3 = 0.117) (  9-Cl-    3px = 0.003) 
+[V 158] occ =  0.00001 fii =      0.696 (  8-Cl-    4pz = 0.993) ( 10-Cl-    3py = 0.002) ( 11-Cl-    3py = 0.002) 
+[V 159] occ =  0.00001 fii =      0.696 (  9-Cl-    4pz = 0.993) ( 10-Cl-    3px = 0.002) ( 11-Cl-    3px = 0.002) 
+[V 160] occ =  0.00001 fii =      0.696 (  2-Cl-    4pz = 0.993) (  6-Cl-    3px = 0.002) (  7-Cl-    3px = 0.002) 
+[V 161] occ =  0.00001 fii =      0.696 (  4-Cl-    4pz = 0.993) (  6-Cl-    3py = 0.002) (  7-Cl-    3py = 0.002) 
+[V 162] occ =  0.00001 fii =      0.699 (  8-Cl-    4px = 0.993) (  5-Cl-    3py = 0.002) (  9-Cl-    3py = 0.002) 
+[V 163] occ =  0.00001 fii =      0.699 (  9-Cl-    4py = 0.993) (  3-Cl-    3px = 0.002) (  8-Cl-    3px = 0.002) 
+[V 164] occ =  0.00001 fii =      0.699 (  2-Cl-    4py = 0.993) (  5-Cl-    3px = 0.002) (  4-Cl-    3px = 0.002) 
+[V 165] occ =  0.00001 fii =      0.699 (  4-Cl-    4px = 0.993) (  3-Cl-    3py = 0.002) (  2-Cl-    3py = 0.002) 
+[V 166] occ =  0.00001 fii =      0.730 (  7-Cl-    4px = 0.989) (  7-Cl-    3px = 0.002) (  2-Cl-    3pz = 0.002) 
+[V 167] occ =  0.00001 fii =      0.730 (  6-Cl-    4py = 0.989) (  6-Cl-    3py = 0.002) (  4-Cl-    3pz = 0.002) 
+[V 168] occ =  0.00001 fii =      0.730 (  7-Cl-    4py = 0.989) (  7-Cl-    3py = 0.002) (  4-Cl-    3pz = 0.002) 
+[V 169] occ =  0.00001 fii =      0.730 (  6-Cl-    4px = 0.989) (  6-Cl-    3px = 0.002) (  2-Cl-    3pz = 0.002) 
+[V 170] occ =  0.00001 fii =      0.730 ( 11-Cl-    4py = 0.989) ( 11-Cl-    3py = 0.002) (  8-Cl-    3pz = 0.002) 
+[V 171] occ =  0.00001 fii =      0.730 ( 10-Cl-    4px = 0.989) ( 10-Cl-    3px = 0.002) (  9-Cl-    3pz = 0.002) 
+[V 172] occ =  0.00001 fii =      0.730 ( 11-Cl-    4px = 0.989) ( 11-Cl-    3px = 0.002) (  9-Cl-    3pz = 0.002) 
+[V 173] occ =  0.00001 fii =      0.730 ( 10-Cl-    4py = 0.989) ( 10-Cl-    3py = 0.002) (  8-Cl-    3pz = 0.002) 
+[V 174] occ =  0.00001 fii =      0.855 (  0-Dy-     6s = 0.815) (  0-Dy-     5s = 0.029) (  4-Cl-     3s = 0.017) 
+[V 175] occ =  0.00001 fii =      0.855 (  1-Dy-     6s = 0.815) (  1-Dy-     5s = 0.029) (  9-Cl-     3s = 0.017) 
+[V 176] occ =  0.00001 fii =      0.773 (  5-Cl-    4pz = 0.985) (  5-Cl-    3pz = 0.004) (  6-Cl-    3py = 0.001) 
+[V 177] occ =  0.00001 fii =      0.773 (  3-Cl-    4pz = 0.985) (  3-Cl-    3pz = 0.004) (  6-Cl-    3px = 0.001) 
+[V 178] occ =  0.00000 fii =      0.699 (  2-Cl-    4px = 0.966) (  0-Dy-     5s = 0.010) (  0-Dy-    5px = 0.008) 
+[V 179] occ =  0.00000 fii =      0.699 (  4-Cl-    4py = 0.966) (  0-Dy-     5s = 0.010) (  0-Dy-    5py = 0.008) 
+[V 180] occ =  0.00000 fii =      0.699 (  8-Cl-    4py = 0.966) (  1-Dy-     5s = 0.010) (  1-Dy-    5py = 0.008) 
+[V 181] occ =  0.00000 fii =      0.699 (  9-Cl-    4px = 0.966) (  1-Dy-     5s = 0.010) (  1-Dy-    5px = 0.008) 
+[V 182] occ =  0.00000 fii =      0.714 (  7-Cl-    4pz = 0.966) (  0-Dy-     5s = 0.010) (  0-Dy-    5pz = 0.008) 
+[V 183] occ =  0.00000 fii =      0.714 (  6-Cl-    4pz = 0.966) (  0-Dy-     5s = 0.010) (  0-Dy-    5pz = 0.008) 
+[V 184] occ =  0.00000 fii =      0.714 ( 11-Cl-    4pz = 0.966) (  1-Dy-     5s = 0.010) (  1-Dy-    5pz = 0.008) 
+[V 185] occ =  0.00000 fii =      0.714 ( 10-Cl-    4pz = 0.966) (  1-Dy-     5s = 0.010) (  1-Dy-    5pz = 0.008) 
+[V 186] occ =  0.00000 fii =      0.592 (  0-Dy-5dx2-y2 = 0.883) (  3-Cl-    3px = 0.020) (  5-Cl-    3py = 0.020) 
+[V 187] occ =  0.00000 fii =      0.592 (  1-Dy-5dx2-y2 = 0.883) (  3-Cl-    3py = 0.020) (  5-Cl-    3px = 0.020) 
+[V 188] occ =  0.00000 fii =      0.586 (  0-Dy-  5dz^2 = 0.883) (  6-Cl-    3pz = 0.025) (  7-Cl-    3pz = 0.025) 
+[V 189] occ =  0.00000 fii =      0.586 (  1-Dy-  5dz^2 = 0.883) ( 10-Cl-    3pz = 0.025) ( 11-Cl-    3pz = 0.025) 
+[V 190] occ =  0.00000 fii =      1.008 (  4-Cl-     4s = 0.981) (  4-Cl-     3s = 0.006) (  0-Dy-    5py = 0.005) 
+[V 191] occ =  0.00000 fii =      1.008 (  2-Cl-     4s = 0.981) (  2-Cl-     3s = 0.006) (  0-Dy-    5px = 0.005) 
+[V 192] occ =  0.00000 fii =      1.008 (  9-Cl-     4s = 0.981) (  9-Cl-     3s = 0.006) (  1-Dy-    5px = 0.005) 
+[V 193] occ =  0.00000 fii =      1.008 (  8-Cl-     4s = 0.981) (  8-Cl-     3s = 0.006) (  1-Dy-    5py = 0.005) 
+[V 194] occ =  0.00000 fii =      0.970 (  0-Dy-     7s = 0.941) (  0-Dy-     5s = 0.006) (  4-Cl-    3py = 0.006) 
+[V 195] occ =  0.00000 fii =      0.970 (  1-Dy-     7s = 0.941) (  1-Dy-     5s = 0.006) (  9-Cl-    3px = 0.006) 
+[V 196] occ =  0.00000 fii =      1.023 (  6-Cl-     4s = 0.980) (  6-Cl-     3s = 0.007) (  0-Dy-    5pz = 0.005) 
+[V 197] occ =  0.00000 fii =      1.023 (  7-Cl-     4s = 0.980) (  7-Cl-     3s = 0.007) (  0-Dy-    5pz = 0.005) 
+[V 198] occ =  0.00000 fii =      1.023 ( 10-Cl-     4s = 0.980) ( 10-Cl-     3s = 0.007) (  1-Dy-    5pz = 0.005) 
+[V 199] occ =  0.00000 fii =      1.023 ( 11-Cl-     4s = 0.980) ( 11-Cl-     3s = 0.007) (  1-Dy-    5pz = 0.005) 
+[V 200] occ =  0.00000 fii =      0.827 (  5-Cl-    4py = 0.958) (  0-Dy-     5s = 0.010) (  0-Dy-    5py = 0.009) 
+[V 201] occ =  0.00000 fii =      0.827 (  3-Cl-    4px = 0.958) (  0-Dy-     5s = 0.010) (  0-Dy-    5px = 0.009) 
+[V 202] occ =  0.00000 fii =      0.827 (  5-Cl-    4px = 0.958) (  1-Dy-     5s = 0.010) (  1-Dy-    5px = 0.009) 
+[V 203] occ =  0.00000 fii =      0.827 (  3-Cl-    4py = 0.958) (  1-Dy-     5s = 0.010) (  1-Dy-    5py = 0.009) 
+[V 204] occ =  0.00000 fii =      0.491 (  0-Dy-   5dxy = 0.967) (  4-Cl-    3px = 0.008) (  2-Cl-    3py = 0.008) 
+[V 205] occ =  0.00000 fii =      0.491 (  1-Dy-   5dxy = 0.967) (  9-Cl-    3py = 0.008) (  8-Cl-    3px = 0.008) 
+[V 206] occ =  0.00000 fii =      1.165 (  3-Cl-     4s = 0.967) (  3-Cl-     3s = 0.014) (  0-Dy-    5px = 0.005) 
+[V 207] occ =  0.00000 fii =      1.165 (  5-Cl-     4s = 0.967) (  5-Cl-     3s = 0.014) (  0-Dy-    5py = 0.005) 
+[V 208] occ =  0.00000 fii =      0.862 (  0-Dy-    6px = 0.862) (  2-Cl-     3s = 0.032) (  3-Cl-     3s = 0.025) 
+[V 209] occ =  0.00000 fii =      0.862 (  0-Dy-    6py = 0.862) (  4-Cl-     3s = 0.032) (  5-Cl-     3s = 0.025) 
+[V 210] occ =  0.00000 fii =      0.862 (  1-Dy-    6py = 0.862) (  8-Cl-     3s = 0.032) (  3-Cl-     3s = 0.025) 
+[V 211] occ =  0.00000 fii =      0.862 (  1-Dy-    6px = 0.862) (  9-Cl-     3s = 0.032) (  5-Cl-     3s = 0.025) 
+[V 212] occ =  0.00000 fii =      2.293 (  1-Dy-   5f 2 = 0.996) (  9-Cl-    3pz = 0.001) (  8-Cl-    3pz = 0.001) 
+[V 213] occ =  0.00000 fii =      2.293 (  0-Dy-   5f 2 = 0.996) (  4-Cl-    3pz = 0.001) (  2-Cl-    3pz = 0.001) 
+[V 214] occ =  0.00000 fii =      2.268 (  1-Dy-   5f-2 = 0.999) (  1-Dy-   4f-2 = 0.001) (  0-Dy-    5pz = 0.000) 
+[V 215] occ =  0.00000 fii =      2.268 (  0-Dy-   5f-2 = 0.999) (  0-Dy-   4f-2 = 0.001) (  1-Dy-    5pz = 0.000) 
+[V 216] occ =  0.00000 fii =      0.815 (  0-Dy-    6pz = 0.858) (  7-Cl-     3s = 0.032) (  6-Cl-     3s = 0.032) 
+[V 217] occ =  0.00000 fii =      0.815 (  1-Dy-    6pz = 0.858) ( 10-Cl-     3s = 0.032) ( 11-Cl-     3s = 0.032) 
+[V 218] occ =  0.00000 fii =      2.340 (  1-Dy-   5f 3 = 0.992) (  5-Cl-    3px = 0.001) (  9-Cl-    3px = 0.001) 
+[V 219] occ =  0.00000 fii =      2.340 (  1-Dy-   5f-3 = 0.992) (  3-Cl-    3py = 0.001) (  8-Cl-    3py = 0.001) 
+[V 220] occ =  0.00000 fii =      2.340 (  0-Dy-   5f 3 = 0.992) (  3-Cl-    3px = 0.001) (  2-Cl-    3px = 0.001) 
+[V 221] occ =  0.00000 fii =      2.340 (  0-Dy-   5f-3 = 0.992) (  5-Cl-    3py = 0.001) (  4-Cl-    3py = 0.001) 
+[V 222] occ =  0.00000 fii =      0.481 (  0-Dy-   5dxz = 0.966) (  6-Cl-    3px = 0.008) (  7-Cl-    3px = 0.008) 
+[V 223] occ =  0.00000 fii =      0.481 (  0-Dy-   5dyz = 0.966) (  6-Cl-    3py = 0.008) (  7-Cl-    3py = 0.008) 
+[V 224] occ =  0.00000 fii =      0.481 (  1-Dy-   5dyz = 0.966) ( 10-Cl-    3py = 0.008) ( 11-Cl-    3py = 0.008) 
+[V 225] occ =  0.00000 fii =      0.481 (  1-Dy-   5dxz = 0.966) ( 10-Cl-    3px = 0.008) ( 11-Cl-    3px = 0.008) 
+[V 226] occ =  0.00000 fii =      2.529 (  1-Dy-    7px = 0.952) (  9-Cl-     3s = 0.017) (  5-Cl-     3s = 0.014) 
+[V 227] occ =  0.00000 fii =      2.529 (  1-Dy-    7py = 0.952) (  8-Cl-     3s = 0.017) (  3-Cl-     3s = 0.014) 
+[V 228] occ =  0.00000 fii =      2.529 (  0-Dy-    7px = 0.952) (  2-Cl-     3s = 0.017) (  3-Cl-     3s = 0.014) 
+[V 229] occ =  0.00000 fii =      2.529 (  0-Dy-    7py = 0.952) (  4-Cl-     3s = 0.017) (  5-Cl-     3s = 0.014) 
+[V 230] occ =  0.00000 fii =      2.455 (  0-Dy-    7pz = 0.951) (  7-Cl-     3s = 0.017) (  6-Cl-     3s = 0.017) 
+[V 231] occ =  0.00000 fii =      2.455 (  1-Dy-    7pz = 0.951) ( 10-Cl-     3s = 0.017) ( 11-Cl-     3s = 0.017) 
+[V 232] occ =  0.00000 fii =      2.319 (  1-Dy-   5f 1 = 0.993) ( 10-Cl-    3px = 0.001) ( 11-Cl-    3px = 0.001) 
+[V 233] occ =  0.00000 fii =      2.319 (  1-Dy-   5f-1 = 0.993) ( 10-Cl-    3py = 0.001) ( 11-Cl-    3py = 0.001) 
+[V 234] occ =  0.00000 fii =      2.319 (  0-Dy-   5f-1 = 0.993) (  6-Cl-    3py = 0.001) (  7-Cl-    3py = 0.001) 
+[V 235] occ =  0.00000 fii =      2.319 (  0-Dy-   5f 1 = 0.993) (  6-Cl-    3px = 0.001) (  7-Cl-    3px = 0.001) 
+[V 236] occ =  0.00000 fii =      1.821 (  0-Dy-  6dz^2 = 0.898) (  6-Cl-     3s = 0.024) (  7-Cl-     3s = 0.024) 
+[V 237] occ =  0.00000 fii =      1.821 (  1-Dy-  6dz^2 = 0.898) ( 10-Cl-     3s = 0.024) ( 11-Cl-     3s = 0.024) 
+[V 238] occ =  0.00000 fii =      1.821 (  1-Dy-6dx2-y2 = 0.900) (  8-Cl-     3s = 0.018) (  9-Cl-     3s = 0.018) 
+[V 239] occ =  0.00000 fii =      1.821 (  0-Dy-6dx2-y2 = 0.900) (  4-Cl-     3s = 0.018) (  2-Cl-     3s = 0.018) 
+[V 240] occ =  0.00000 fii =      2.360 (  0-Dy-   5f 0 = 0.989) (  7-Cl-    3pz = 0.002) (  6-Cl-    3pz = 0.002) 
+[V 241] occ =  0.00000 fii =      2.360 (  1-Dy-   5f 0 = 0.989) ( 11-Cl-    3pz = 0.002) ( 10-Cl-    3pz = 0.002) 
+[V 242] occ =  0.00000 fii =      1.490 (  0-Dy-   6dxy = 0.962) (  4-Cl-    3px = 0.010) (  2-Cl-    3py = 0.010) 
+[V 243] occ =  0.00000 fii =      1.490 (  1-Dy-   6dxy = 0.962) (  9-Cl-    3py = 0.010) (  8-Cl-    3px = 0.010) 
+[V 244] occ =  0.00000 fii =      1.446 (  0-Dy-   6dxz = 0.962) (  2-Cl-    3pz = 0.010) (  6-Cl-    3px = 0.009) 
+[V 245] occ =  0.00000 fii =      1.446 (  0-Dy-   6dyz = 0.962) (  4-Cl-    3pz = 0.010) (  6-Cl-    3py = 0.009) 
+[V 246] occ =  0.00000 fii =      1.446 (  1-Dy-   6dyz = 0.962) (  8-Cl-    3pz = 0.010) ( 10-Cl-    3py = 0.009) 
+[V 247] occ =  0.00000 fii =      1.446 (  1-Dy-   6dxz = 0.962) (  9-Cl-    3pz = 0.010) ( 10-Cl-    3px = 0.009) 
+   [  0] occ = 2.00000 | (1-Dy-2s       = 0.632) (1-Dy-3s       = 0.147) (1-Dy-3pz      = 0.053) 
+   [  1] occ = 2.00000 | (0-Dy-2s       = 0.210) (0-Dy-2px      = 0.184) (0-Dy-3dxz     = 0.094) 
+   [  2] occ = 2.00000 | (1-Dy-2px      = 0.397) (1-Dy-3dxz     = 0.197) (1-Dy-1s       = 0.148) 
+   [  3] occ = 2.00000 | (0-Dy-2py      = 0.309) (0-Dy-1s       = 0.193) (0-Dy-3dx2-y2  = 0.140) 
+   [  4] occ = 2.00000 | (1-Dy-3dz^2    = 0.242) (1-Dy-3py      = 0.160) (1-Dy-2s       = 0.129) 
+   [  5] occ = 2.00000 | (1-Dy-3dxy     = 0.248) (1-Dy-3py      = 0.174) (1-Dy-2py      = 0.141) 
+   [  6] occ = 2.00000 | (1-Dy-3px      = 0.279) (1-Dy-3dxy     = 0.119) (1-Dy-3dxz     = 0.100) 
+   [  7] occ = 2.00000 | (1-Dy-3dyz     = 0.344) (1-Dy-3dxz     = 0.150) (1-Dy-1s       = 0.147) 
+   [  8] occ = 2.00000 | (0-Dy-2s       = 0.313) (0-Dy-3dyz     = 0.166) (0-Dy-3px      = 0.138) 
+   [  9] occ = 2.00000 | (1-Dy-3s       = 0.231) (1-Dy-3px      = 0.208) (1-Dy-2py      = 0.173) 
+   [ 10] occ = 2.00000 | (1-Dy-3dx2-y2  = 0.270) (1-Dy-3py      = 0.175) (1-Dy-2px      = 0.164) 
+   [ 11] occ = 2.00000 | (0-Dy-3dxz     = 0.256) (0-Dy-3dxy     = 0.178) (0-Dy-2pz      = 0.120) 
+   [ 12] occ = 2.00000 | (1-Dy-2pz      = 0.286) (1-Dy-2py      = 0.221) (1-Dy-3dxy     = 0.177) 
+   [ 13] occ = 2.00000 | (9-Cl-2pz      = 0.812) (9-Cl-2py      = 0.161) (9-Cl-2px      = 0.014) 
+   [ 14] occ = 2.00000 | (6-Cl-2py      = 0.956) (6-Cl-2px      = 0.040) (6-Cl-2pz      = 0.001) 
+   [ 15] occ = 2.00000 | (1-Dy-2pz      = 0.235) (1-Dy-3dz^2    = 0.139) (1-Dy-3dxz     = 0.122) 
+   [ 16] occ = 2.00000 | (7-Cl-2px      = 0.842) (7-Cl-2py      = 0.112) (7-Cl-2pz      = 0.045) 
+   [ 17] occ = 2.00000 | (4-Cl-2pz      = 0.664) (4-Cl-2px      = 0.263) (4-Cl-2py      = 0.046) 
+   [ 18] occ = 2.00000 | (1-Dy-3dyz     = 0.238) (1-Dy-3dz^2    = 0.236) (1-Dy-2pz      = 0.158) 
+   [ 19] occ = 2.00000 | (1-Dy-3dx2-y2  = 0.452) (1-Dy-3dxz     = 0.107) (1-Dy-3s       = 0.080) 
+   [ 20] occ = 2.00000 | (0-Dy-3pz      = 0.209) (0-Dy-3s       = 0.193) (0-Dy-3dz^2    = 0.155) 
+   [ 21] occ = 2.00000 | (2-Cl-2pz      = 0.559) (2-Cl-1s       = 0.252) (2-Cl-2py      = 0.135) 
+   [ 22] occ = 2.00000 | (10-Cl-2px      = 0.702) (10-Cl-1s       = 0.158) (10-Cl-2py      = 0.135) 
+   [ 23] occ = 2.00000 | (8-Cl-2pz      = 0.511) (8-Cl-2px      = 0.321) (8-Cl-1s       = 0.149) 
+   [ 24] occ = 2.00000 | (7-Cl-2py      = 0.785) (7-Cl-1s       = 0.079) (7-Cl-2pz      = 0.067) 
+   [ 25] occ = 2.00000 | (10-Cl-2py      = 0.710) (10-Cl-1s       = 0.272) (10-Cl-2px      = 0.014) 
+   [ 26] occ = 2.00000 | (11-Cl-2py      = 0.824) (11-Cl-2px      = 0.122) (11-Cl-1s       = 0.043) 
+   [ 27] occ = 2.00000 | (0-Dy-2s       = 0.299) (0-Dy-2px      = 0.190) (0-Dy-2pz      = 0.161) 
+   [ 28] occ = 2.00000 | (11-Cl-1s       = 0.639) (11-Cl-2pz      = 0.317) (11-Cl-2py      = 0.030) 
+   [ 29] occ = 2.00000 | (6-Cl-1s       = 0.554) (6-Cl-2px      = 0.419) (6-Cl-2py      = 0.016) 
+   [ 30] occ = 2.00000 | (0-Dy-2py      = 0.333) (0-Dy-3dxy     = 0.216) (0-Dy-3py      = 0.077) 
+   [ 31] occ = 2.00000 | (3-Cl-2pz      = 0.987) (3-Cl-1s       = 0.011) (3-Cl-2py      = 0.001) 
+   [ 32] occ = 2.00000 | (2-Cl-2py      = 0.572) (2-Cl-2pz      = 0.281) (2-Cl-2px      = 0.138) 
+   [ 33] occ = 2.00000 | (2-Cl-2px      = 0.387) (2-Cl-2py      = 0.289) (2-Cl-1s       = 0.252) 
+   [ 34] occ = 2.00000 | (7-Cl-1s       = 0.773) (7-Cl-2py      = 0.095) (7-Cl-2pz      = 0.088) 
+   [ 35] occ = 2.00000 | (0-Dy-3dxy     = 0.306) (0-Dy-3dxz     = 0.248) (0-Dy-3py      = 0.123) 
+   [ 36] occ = 2.00000 | (5-Cl-2pz      = 0.720) (5-Cl-1s       = 0.222) (5-Cl-2py      = 0.056) 
+   [ 37] occ = 2.00000 | (0-Dy-3py      = 0.168) (0-Dy-3dz^2    = 0.140) (0-Dy-3dxz     = 0.126) 
+   [ 38] occ = 2.00000 | (1-Dy-4s       = 0.833) (1-Dy-3s       = 0.116) (1-Dy-4dz^2    = 0.029) 
+   [ 39] occ = 2.00000 | (0-Dy-4s       = 0.832) (0-Dy-3s       = 0.117) (0-Dy-4dz^2    = 0.029) 
+   [ 40] occ = 2.00000 | (6-Cl-2pz      = 0.591) (6-Cl-2px      = 0.266) (6-Cl-1s       = 0.134) 
+   [ 41] occ = 2.00000 | (9-Cl-2px      = 0.601) (9-Cl-1s       = 0.202) (9-Cl-2py      = 0.193) 
+   [ 42] occ = 2.00000 | (0-Dy-3dz^2    = 0.264) (0-Dy-3dx2-y2  = 0.206) (0-Dy-2pz      = 0.123) 
+   [ 43] occ = 2.00000 | (11-Cl-2px      = 0.488) (11-Cl-2pz      = 0.322) (11-Cl-2py      = 0.139) 
+   [ 44] occ = 2.00000 | (8-Cl-1s       = 0.710) (8-Cl-2pz      = 0.264) (8-Cl-2py      = 0.016) 
+   [ 45] occ = 2.00000 | (4-Cl-1s       = 0.575) (4-Cl-2px      = 0.222) (4-Cl-2pz      = 0.195) 
+   [ 46] occ = 2.00000 | (5-Cl-1s       = 0.758) (5-Cl-2pz      = 0.219) (5-Cl-2s       = 0.014) 
+   [ 47] occ = 2.00000 | (0-Dy-3s       = 0.389) (0-Dy-3dz^2    = 0.164) (0-Dy-3dx2-y2  = 0.082) 
+   [ 48] occ = 2.00000 | (8-Cl-2py      = 0.482) (8-Cl-2px      = 0.395) (8-Cl-2pz      = 0.096) 
+   [ 49] occ = 2.00000 | (1-Dy-4py      = 0.525) (1-Dy-4px      = 0.330) (1-Dy-3py      = 0.088) 
+   [ 50] occ = 2.00000 | (0-Dy-4px      = 0.646) (0-Dy-4py      = 0.172) (0-Dy-3px      = 0.105) 
+   [ 51] occ = 2.00000 | (1-Dy-4px      = 0.508) (1-Dy-4py      = 0.315) (1-Dy-3px      = 0.093) 
+   [ 52] occ = 2.00000 | (0-Dy-4py      = 0.652) (0-Dy-4px      = 0.173) (0-Dy-3py      = 0.118) 
+   [ 53] occ = 2.00000 | (9-Cl-1s       = 0.592) (9-Cl-2py      = 0.283) (9-Cl-2pz      = 0.099) 
+   [ 54] occ = 2.00000 | (0-Dy-4pz      = 0.825) (0-Dy-3pz      = 0.130) (0-Dy-4px      = 0.026) 
+   [ 55] occ = 2.00000 | (1-Dy-4pz      = 0.863) (1-Dy-3pz      = 0.136) (1-Dy-5pz      = 0.001) 
+   [ 56] occ = 2.00000 | (3-Cl-1s       = 0.557) (3-Cl-2px      = 0.333) (3-Cl-2py      = 0.099) 
+   [ 57] occ = 2.00000 | (4-Cl-2py      = 0.809) (4-Cl-2px      = 0.134) (4-Cl-1s       = 0.044) 
+   [ 58] occ = 2.00000 | (1-Dy-3pz      = 0.280) (1-Dy-1s       = 0.171) (1-Dy-3dyz     = 0.086) 
+   [ 59] occ = 2.00000 | (3-Cl-2py      = 0.463) (3-Cl-1s       = 0.355) (3-Cl-2px      = 0.173) 
+   [ 60] occ = 2.00000 | (10-Cl-1s       = 0.519) (10-Cl-2px      = 0.280) (10-Cl-2py      = 0.149) 
+   [ 61] occ = 2.00000 | (10-Cl-2pz      = 0.949) (10-Cl-1s       = 0.037) (10-Cl-2s       = 0.009) 
+   [ 62] occ = 2.00000 | (4-Cl-2px      = 0.381) (4-Cl-1s       = 0.339) (4-Cl-2pz      = 0.137) 
+   [ 63] occ = 2.00000 | (0-Dy-2px      = 0.293) (0-Dy-3py      = 0.122) (0-Dy-3pz      = 0.099) 
+   [ 64] occ = 2.00000 | (8-Cl-2py      = 0.462) (8-Cl-2px      = 0.281) (8-Cl-2pz      = 0.129) 
+   [ 65] occ = 2.00000 | (1-Dy-3s       = 0.200) (1-Dy-3dyz     = 0.185) (1-Dy-3dxy     = 0.144) 
+   [ 66] occ = 2.00000 | (5-Cl-2px      = 0.826) (5-Cl-2py      = 0.152) (5-Cl-2pz      = 0.016) 
+   [ 67] occ = 2.00000 | (9-Cl-2py      = 0.362) (9-Cl-2px      = 0.348) (9-Cl-1s       = 0.178) 
+   [ 68] occ = 2.00000 | (5-Cl-2py      = 0.770) (5-Cl-2px      = 0.156) (5-Cl-2pz      = 0.045) 
+   [ 69] occ = 2.00000 | (11-Cl-2px      = 0.374) (11-Cl-2pz      = 0.336) (11-Cl-1s       = 0.256) 
+   [ 70] occ = 2.00000 | (6-Cl-2pz      = 0.381) (6-Cl-1s       = 0.298) (6-Cl-2px      = 0.271) 
+   [ 71] occ = 2.00000 | (3-Cl-2px      = 0.477) (3-Cl-2py      = 0.421) (3-Cl-1s       = 0.058) 
+   [ 72] occ = 2.00000 | (7-Cl-2pz      = 0.783) (7-Cl-1s       = 0.134) (7-Cl-2px      = 0.047) 
+   [ 73] occ = 2.00000 | (2-Cl-1s       = 0.476) (2-Cl-2px      = 0.398) (2-Cl-2pz      = 0.089) 
+   [ 74] occ = 2.00000 | (0-Dy-1s       = 0.381) (0-Dy-2pz      = 0.215) (0-Dy-4dxz     = 0.105) 
+   [ 75] occ = 2.00000 | (0-Dy-4dxy     = 0.204) (0-Dy-3dyz     = 0.202) (0-Dy-3px      = 0.168) 
+   [ 76] occ = 2.00000 | (0-Dy-4dxy     = 0.519) (0-Dy-3pz      = 0.137) (0-Dy-2pz      = 0.083) 
+   [ 77] occ = 2.00000 | (0-Dy-4dyz     = 0.362) (0-Dy-4dxz     = 0.352) (0-Dy-1s       = 0.118) 
+   [ 78] occ = 2.00000 | (1-Dy-4dyz     = 0.430) (1-Dy-4dxz     = 0.330) (1-Dy-3s       = 0.054) 
+   [ 79] occ = 2.00000 | (0-Dy-4dxz     = 0.482) (0-Dy-4dyz     = 0.452) (0-Dy-3dyz     = 0.016) 
+   [ 80] occ = 2.00000 | (0-Dy-4dz^2    = 0.952) (0-Dy-4s       = 0.023) (0-Dy-3dz^2    = 0.014) 
+   [ 81] occ = 2.00000 | (1-Dy-4dz^2    = 0.950) (1-Dy-4s       = 0.023) (1-Dy-3dz^2    = 0.014) 
+   [ 82] occ = 2.00000 | (1-Dy-4dxz     = 0.512) (1-Dy-4dyz     = 0.414) (1-Dy-3dxz     = 0.021) 
+   [ 83] occ = 2.00000 | (0-Dy-4dx2-y2  = 0.981) (0-Dy-3dx2-y2  = 0.016) (0-Dy-4dxy     = 0.001) 
+   [ 84] occ = 2.00000 | (1-Dy-4dx2-y2  = 0.970) (1-Dy-3dx2-y2  = 0.014) (1-Dy-4dxz     = 0.008) 
+   [ 85] occ = 2.00000 | (1-Dy-4dxy     = 0.918) (1-Dy-3dxy     = 0.042) (1-Dy-3dx2-y2  = 0.010) 
+   [ 86] occ = 2.00000 | (5-Cl-2s       = 0.602) (5-Cl-3s       = 0.306) (5-Cl-3px      = 0.025) 
+   [ 87] occ = 2.00000 | (3-Cl-2s       = 0.602) (3-Cl-3s       = 0.306) (3-Cl-3px      = 0.025) 
+   [ 88] occ = 2.00000 | (1-Dy-5px      = 1.027) (1-Dy-5s       = 0.007) (5-Cl-3px      = 0.003) 
+   [ 89] occ = 2.00000 | (0-Dy-5px      = 1.027) (0-Dy-5s       = 0.007) (3-Cl-3px      = 0.003) 
+   [ 90] occ = 2.00000 | (1-Dy-5py      = 1.027) (1-Dy-5s       = 0.007) (3-Cl-3py      = 0.003) 
+   [ 91] occ = 2.00000 | (0-Dy-5py      = 1.027) (0-Dy-5s       = 0.007) (5-Cl-3py      = 0.003) 
+   [ 92] occ = 2.00000 | (1-Dy-5pz      = 1.032) (10-Cl-3pz      = 0.003) (11-Cl-3pz      = 0.003) 
+   [ 93] occ = 2.00000 | (0-Dy-5pz      = 1.032) (6-Cl-3pz      = 0.003) (7-Cl-3pz      = 0.003) 
+   [ 94] occ = 2.00000 | (1-Dy-5s       = 0.980) (1-Dy-5py      = 0.007) (1-Dy-5px      = 0.007) 
+   [ 95] occ = 2.00000 | (0-Dy-5s       = 0.980) (0-Dy-5px      = 0.007) (0-Dy-5py      = 0.007) 
+   [ 96] occ = 2.00000 | (4-Cl-2s       = 0.466) (4-Cl-3s       = 0.435) (4-Cl-3py      = 0.069) 
+   [ 97] occ = 2.00000 | (2-Cl-2s       = 0.466) (2-Cl-3s       = 0.435) (2-Cl-3px      = 0.069) 
+   [ 98] occ = 2.00000 | (8-Cl-2s       = 0.466) (8-Cl-3s       = 0.435) (8-Cl-3py      = 0.069) 
+   [ 99] occ = 2.00000 | (9-Cl-2s       = 0.466) (9-Cl-3s       = 0.435) (9-Cl-3px      = 0.069) 
+   [100] occ = 2.00000 | (11-Cl-2s       = 0.658) (11-Cl-3s       = 0.190) (11-Cl-3pz      = 0.138) 
+   [101] occ = 2.00000 | (10-Cl-2s       = 0.658) (10-Cl-3s       = 0.190) (10-Cl-3pz      = 0.138) 
+   [102] occ = 2.00000 | (6-Cl-2s       = 0.658) (6-Cl-3s       = 0.190) (6-Cl-3pz      = 0.138) 
+   [103] occ = 2.00000 | (7-Cl-2s       = 0.658) (7-Cl-3s       = 0.190) (7-Cl-3pz      = 0.138) 
+   [104] occ = 2.00000 | (6-Cl-3s       = 0.582) (6-Cl-2s       = 0.290) (6-Cl-3pz      = 0.107) 
+   [105] occ = 2.00000 | (7-Cl-3s       = 0.582) (7-Cl-2s       = 0.290) (7-Cl-3pz      = 0.107) 
+   [106] occ = 2.00000 | (10-Cl-3s       = 0.582) (10-Cl-2s       = 0.290) (10-Cl-3pz      = 0.107) 
+   [107] occ = 2.00000 | (11-Cl-3s       = 0.582) (11-Cl-2s       = 0.290) (11-Cl-3pz      = 0.107) 
+   [108] occ = 2.00000 | (8-Cl-2s       = 0.476) (8-Cl-3s       = 0.314) (8-Cl-3py      = 0.200) 
+   [109] occ = 2.00000 | (2-Cl-2s       = 0.476) (2-Cl-3s       = 0.314) (2-Cl-3px      = 0.200) 
+   [110] occ = 2.00000 | (9-Cl-2s       = 0.477) (9-Cl-3s       = 0.314) (9-Cl-3px      = 0.200) 
+   [111] occ = 2.00000 | (4-Cl-2s       = 0.476) (4-Cl-3s       = 0.314) (4-Cl-3py      = 0.200) 
+   [112] occ = 2.00000 | (3-Cl-3s       = 0.375) (3-Cl-2s       = 0.323) (3-Cl-3px      = 0.145) 
+   [113] occ = 2.00000 | (5-Cl-3s       = 0.375) (5-Cl-2s       = 0.323) (5-Cl-3px      = 0.145) 
+ * [114] occ = 1.99999 | (1-Dy-4f 2     = 0.500) (0-Dy-4f 2     = 0.500) (1-Dy-5f 2     = 0.000) 
+   [115] occ = 1.99999 | (6-Cl-3pz      = 0.705) (6-Cl-3s       = 0.207) (6-Cl-2s       = 0.019) 
+   [116] occ = 1.99999 | (7-Cl-3pz      = 0.705) (7-Cl-3s       = 0.207) (7-Cl-2s       = 0.019) 
+   [117] occ = 1.99999 | (10-Cl-3pz      = 0.705) (10-Cl-3s       = 0.207) (10-Cl-2s       = 0.019) 
+   [118] occ = 1.99999 | (11-Cl-3pz      = 0.705) (11-Cl-3s       = 0.207) (11-Cl-2s       = 0.019) 
+   [119] occ = 1.99999 | (4-Cl-3py      = 0.689) (4-Cl-3s       = 0.228) (4-Cl-2s       = 0.022) 
+   [120] occ = 1.99999 | (9-Cl-3px      = 0.689) (9-Cl-3s       = 0.228) (9-Cl-2s       = 0.022) 
+   [121] occ = 1.99999 | (8-Cl-3py      = 0.689) (8-Cl-3s       = 0.228) (8-Cl-2s       = 0.022) 
+   [122] occ = 1.99999 | (2-Cl-3px      = 0.689) (2-Cl-3s       = 0.228) (2-Cl-2s       = 0.022) 
+ * [123] occ = 1.99999 | (1-Dy-4f-2     = 0.486) (0-Dy-4f-2     = 0.486) (0-Dy-4f 0     = 0.013) 
+ * [124] occ = 1.99999 | (3-Cl-3px      = 0.745) (3-Cl-3s       = 0.146) (3-Cl-2s       = 0.013) 
+ * [125] occ = 1.99999 | (5-Cl-3py      = 0.745) (5-Cl-3s       = 0.147) (5-Cl-2s       = 0.013) 
+ * [126] occ = 1.99999 | (5-Cl-3px      = 0.745) (5-Cl-3s       = 0.146) (5-Cl-2s       = 0.013) 
+ * [127] occ = 1.99999 | (3-Cl-3py      = 0.745) (3-Cl-3s       = 0.146) (3-Cl-2s       = 0.013) 
+ * [128] occ = 1.99999 | (1-Dy-4f 3     = 0.222) (0-Dy-4f 3     = 0.222) (1-Dy-4f-3     = 0.222) 
+ * [129] occ = 1.99999 | (1-Dy-4f-3     = 0.217) (0-Dy-4f-3     = 0.217) (1-Dy-4f 3     = 0.217) 
+ * [130] occ = 1.99999 | (5-Cl-3pz      = 0.966) (0-Dy-5dyz     = 0.001) (1-Dy-5dxz     = 0.001) 
+ * [131] occ = 1.99999 | (3-Cl-3pz      = 0.966) (0-Dy-5dxz     = 0.001) (1-Dy-5dyz     = 0.001) 
+   [132] occ = 1.99999 | (7-Cl-3py      = 0.982) (0-Dy-5dyz     = 0.001) (7-Cl-3pz      = 0.001) 
+   [133] occ = 1.99999 | (6-Cl-3px      = 0.982) (0-Dy-5dxz     = 0.001) (6-Cl-3pz      = 0.001) 
+   [134] occ = 1.99999 | (7-Cl-3px      = 0.982) (0-Dy-5dxz     = 0.001) (7-Cl-3pz      = 0.001) 
+   [135] occ = 1.99999 | (11-Cl-3px      = 0.982) (1-Dy-5dxz     = 0.001) (11-Cl-3pz      = 0.001) 
+   [136] occ = 1.99999 | (6-Cl-3py      = 0.982) (0-Dy-5dyz     = 0.001) (6-Cl-3pz      = 0.001) 
+   [137] occ = 1.99999 | (10-Cl-3py      = 0.982) (1-Dy-5dyz     = 0.001) (10-Cl-3pz      = 0.001) 
+   [138] occ = 1.99999 | (10-Cl-3px      = 0.982) (1-Dy-5dxz     = 0.001) (10-Cl-3pz      = 0.001) 
+   [139] occ = 1.99999 | (11-Cl-3py      = 0.982) (1-Dy-5dyz     = 0.001) (11-Cl-3pz      = 0.001) 
+   [140] occ = 1.99999 | (8-Cl-3px      = 0.983) (1-Dy-5dxy     = 0.001) (8-Cl-3py      = 0.001) 
+   [141] occ = 1.99999 | (4-Cl-3px      = 0.983) (0-Dy-5dxy     = 0.001) (4-Cl-3py      = 0.001) 
+   [142] occ = 1.99999 | (9-Cl-3py      = 0.983) (1-Dy-5dxy     = 0.001) (9-Cl-3px      = 0.001) 
+   [143] occ = 1.99999 | (2-Cl-3py      = 0.983) (0-Dy-5dxy     = 0.001) (2-Cl-3px      = 0.001) 
+   [144] occ = 1.99999 | (8-Cl-3pz      = 0.985) (1-Dy-5dyz     = 0.001) (8-Cl-2pz      = 0.001) 
+   [145] occ = 1.99999 | (9-Cl-3pz      = 0.985) (1-Dy-5dxz     = 0.001) (9-Cl-2pz      = 0.001) 
+   [146] occ = 1.99999 | (4-Cl-3pz      = 0.985) (0-Dy-5dyz     = 0.001) (4-Cl-2pz      = 0.001) 
+   [147] occ = 1.99999 | (2-Cl-3pz      = 0.985) (0-Dy-5dxz     = 0.001) (2-Cl-2pz      = 0.001) 
+ * [148] occ = 1.00000 | (0-Dy-4f-2     = 0.486) (1-Dy-4f-2     = 0.486) (0-Dy-4f 0     = 0.013) 
+ * [149] occ = 1.00000 | (0-Dy-4f 3     = 0.217) (1-Dy-4f 3     = 0.217) (0-Dy-4f-3     = 0.216) 
+ * [150] occ = 1.00000 | (0-Dy-4f-1     = 0.874) (0-Dy-4f-3     = 0.118) (4-Cl-3py      = 0.003) 
+ * [151] occ = 1.00000 | (0-Dy-4f-3     = 0.221) (1-Dy-4f-3     = 0.221) (0-Dy-4f 3     = 0.220) 
+ * [152] occ = 1.00000 | (1-Dy-4f 0     = 0.964) (1-Dy-4f-2     = 0.026) (10-Cl-3pz      = 0.005) 
+ * [153] occ = 1.00000 | (0-Dy-4f 1     = 0.874) (0-Dy-4f 3     = 0.118) (2-Cl-3px      = 0.003) 
+ * [154] occ = 1.00000 | (1-Dy-4f-1     = 0.874) (1-Dy-4f-3     = 0.118) (8-Cl-3py      = 0.003) 
+ * [155] occ = 1.00000 | (0-Dy-4f 0     = 0.964) (0-Dy-4f-2     = 0.026) (7-Cl-3pz      = 0.005) 
+ * [156] occ = 1.00000 | (0-Dy-4f 2     = 0.498) (1-Dy-4f 2     = 0.498) (3-Cl-3pz      = 0.002) 
+ * [157] occ = 1.00000 | (1-Dy-4f 1     = 0.874) (1-Dy-4f 3     = 0.118) (9-Cl-3px      = 0.003) 
+   [158] occ = 0.00001 | (8-Cl-4pz      = 1.303) (1-Dy-6pz      = 0.043) (1-Dy-7pz      = 0.021) 
+   [159] occ = 0.00001 | (9-Cl-4pz      = 1.303) (1-Dy-6pz      = 0.043) (1-Dy-7pz      = 0.021) 
+   [160] occ = 0.00001 | (2-Cl-4pz      = 1.303) (0-Dy-6pz      = 0.043) (0-Dy-7pz      = 0.021) 
+   [161] occ = 0.00001 | (4-Cl-4pz      = 1.303) (0-Dy-6pz      = 0.043) (0-Dy-7pz      = 0.021) 
+   [162] occ = 0.00001 | (8-Cl-4px      = 1.312) (1-Dy-6px      = 0.037) (5-Cl-4py      = 0.019) 
+   [163] occ = 0.00001 | (9-Cl-4py      = 1.312) (1-Dy-6py      = 0.037) (3-Cl-4px      = 0.019) 
+   [164] occ = 0.00001 | (2-Cl-4py      = 1.312) (0-Dy-6py      = 0.037) (5-Cl-4px      = 0.019) 
+   [165] occ = 0.00001 | (4-Cl-4px      = 1.312) (0-Dy-6px      = 0.037) (3-Cl-4py      = 0.019) 
+   [166] occ = 0.00001 | (7-Cl-4px      = 1.398) (0-Dy-6px      = 0.041) (7-Cl-3px      = 0.020) 
+   [167] occ = 0.00001 | (6-Cl-4py      = 1.398) (0-Dy-6py      = 0.041) (6-Cl-3py      = 0.020) 
+   [168] occ = 0.00001 | (7-Cl-4py      = 1.398) (0-Dy-6py      = 0.041) (7-Cl-3py      = 0.020) 
+   [169] occ = 0.00001 | (6-Cl-4px      = 1.398) (0-Dy-6px      = 0.041) (6-Cl-3px      = 0.020) 
+   [170] occ = 0.00001 | (11-Cl-4py      = 1.398) (1-Dy-6py      = 0.041) (11-Cl-3py      = 0.020) 
+   [171] occ = 0.00001 | (10-Cl-4px      = 1.398) (1-Dy-6px      = 0.041) (10-Cl-3px      = 0.020) 
+   [172] occ = 0.00001 | (11-Cl-4px      = 1.398) (1-Dy-6px      = 0.041) (11-Cl-3px      = 0.020) 
+   [173] occ = 0.00001 | (10-Cl-4py      = 1.398) (1-Dy-6py      = 0.041) (10-Cl-3py      = 0.020) 
+   [174] occ = 0.00001 | (0-Dy-6s       = 18.841) (0-Dy-5s       = 1.852) (1-Dy-6s       = 1.496) 
+   [175] occ = 0.00001 | (1-Dy-6s       = 18.841) (1-Dy-5s       = 1.852) (0-Dy-6s       = 1.496) 
+   [176] occ = 0.00001 | (5-Cl-4pz      = 1.597) (5-Cl-3pz      = 0.046) (0-Dy-6pz      = 0.039) 
+   [177] occ = 0.00001 | (3-Cl-4pz      = 1.597) (3-Cl-3pz      = 0.046) (0-Dy-6pz      = 0.039) 
+   [178] occ = 0.00000 | (2-Cl-4px      = 1.719) (0-Dy-6px      = 0.177) (2-Cl-4s       = 0.106) 
+   [179] occ = 0.00000 | (4-Cl-4py      = 1.719) (0-Dy-6py      = 0.177) (4-Cl-4s       = 0.106) 
+   [180] occ = 0.00000 | (8-Cl-4py      = 1.719) (1-Dy-6py      = 0.177) (8-Cl-4s       = 0.106) 
+   [181] occ = 0.00000 | (9-Cl-4px      = 1.719) (1-Dy-6px      = 0.177) (9-Cl-4s       = 0.106) 
+   [182] occ = 0.00000 | (7-Cl-4pz      = 1.750) (0-Dy-6pz      = 0.171) (7-Cl-4s       = 0.105) 
+   [183] occ = 0.00000 | (6-Cl-4pz      = 1.750) (0-Dy-6pz      = 0.171) (6-Cl-4s       = 0.105) 
+   [184] occ = 0.00000 | (11-Cl-4pz      = 1.750) (1-Dy-6pz      = 0.171) (11-Cl-4s       = 0.105) 
+   [185] occ = 0.00000 | (10-Cl-4pz      = 1.750) (1-Dy-6pz      = 0.171) (10-Cl-4s       = 0.105) 
+   [186] occ = 0.00000 | (0-Dy-5dx2-y2  = 1.796) (0-Dy-6dx2-y2  = 0.192) (3-Cl-3px      = 0.137) 
+   [187] occ = 0.00000 | (1-Dy-5dx2-y2  = 1.796) (1-Dy-6dx2-y2  = 0.192) (3-Cl-3py      = 0.137) 
+   [188] occ = 0.00000 | (0-Dy-5dz^2    = 1.780) (0-Dy-6dz^2    = 0.187) (6-Cl-3pz      = 0.162) 
+   [189] occ = 0.00000 | (1-Dy-5dz^2    = 1.780) (1-Dy-6dz^2    = 0.187) (10-Cl-3pz      = 0.162) 
+   [190] occ = 0.00000 | (4-Cl-4s       = 2.220) (0-Dy-6py      = 0.390) (4-Cl-3s       = 0.303) 
+   [191] occ = 0.00000 | (2-Cl-4s       = 2.220) (0-Dy-6px      = 0.390) (2-Cl-3s       = 0.303) 
+   [192] occ = 0.00000 | (9-Cl-4s       = 2.220) (1-Dy-6px      = 0.390) (9-Cl-3s       = 0.303) 
+   [193] occ = 0.00000 | (8-Cl-4s       = 2.220) (1-Dy-6py      = 0.390) (8-Cl-3s       = 0.303) 
+   [194] occ = 0.00000 | (0-Dy-7s       = 1.783) (1-Dy-6s       = 0.097) (0-Dy-6s       = 0.042) 
+   [195] occ = 0.00000 | (1-Dy-7s       = 1.783) (0-Dy-6s       = 0.097) (1-Dy-6s       = 0.042) 
+   [196] occ = 0.00000 | (6-Cl-4s       = 2.251) (0-Dy-6pz      = 0.379) (6-Cl-3s       = 0.314) 
+   [197] occ = 0.00000 | (7-Cl-4s       = 2.251) (0-Dy-6pz      = 0.379) (7-Cl-3s       = 0.314) 
+   [198] occ = 0.00000 | (10-Cl-4s       = 2.251) (1-Dy-6pz      = 0.379) (10-Cl-3s       = 0.314) 
+   [199] occ = 0.00000 | (11-Cl-4s       = 2.251) (1-Dy-6pz      = 0.379) (11-Cl-3s       = 0.314) 
+   [200] occ = 0.00000 | (5-Cl-4py      = 2.350) (0-Dy-6py      = 0.267) (0-Dy-6s       = 0.241) 
+   [201] occ = 0.00000 | (3-Cl-4px      = 2.350) (0-Dy-6px      = 0.267) (0-Dy-6s       = 0.241) 
+   [202] occ = 0.00000 | (5-Cl-4px      = 2.350) (1-Dy-6px      = 0.267) (1-Dy-6s       = 0.241) 
+   [203] occ = 0.00000 | (3-Cl-4py      = 2.350) (1-Dy-6py      = 0.267) (1-Dy-6s       = 0.241) 
+   [204] occ = 0.00000 | (0-Dy-5dxy     = 1.216) (3-Cl-3py      = 0.028) (5-Cl-3px      = 0.028) 
+   [205] occ = 0.00000 | (1-Dy-5dxy     = 1.216) (3-Cl-3px      = 0.028) (5-Cl-3py      = 0.028) 
+   [206] occ = 0.00000 | (3-Cl-4s       = 3.064) (3-Cl-3s       = 0.743) (0-Dy-6px      = 0.252) 
+   [207] occ = 0.00000 | (5-Cl-4s       = 3.064) (5-Cl-3s       = 0.743) (0-Dy-6py      = 0.252) 
+   [208] occ = 0.00000 | (0-Dy-6px      = 6.900) (2-Cl-3s       = 0.755) (0-Dy-7px      = 0.747) 
+   [209] occ = 0.00000 | (0-Dy-6py      = 6.900) (4-Cl-3s       = 0.755) (0-Dy-7py      = 0.747) 
+   [210] occ = 0.00000 | (1-Dy-6py      = 6.900) (8-Cl-3s       = 0.755) (1-Dy-7py      = 0.747) 
+   [211] occ = 0.00000 | (1-Dy-6px      = 6.900) (9-Cl-3s       = 0.755) (1-Dy-7px      = 0.747) 
+   [212] occ = 0.00000 | (1-Dy-5f 2     = 1.018) (3-Cl-3pz      = 0.003) (5-Cl-3pz      = 0.003) 
+   [213] occ = 0.00000 | (0-Dy-5f 2     = 1.018) (3-Cl-3pz      = 0.003) (5-Cl-3pz      = 0.003) 
+   [214] occ = 0.00000 | (1-Dy-5f-2     = 1.002) (0-Dy-6pz      = 0.001) (1-Dy-4f-2     = 0.001) 
+   [215] occ = 0.00000 | (0-Dy-5f-2     = 1.002) (1-Dy-6pz      = 0.001) (0-Dy-4f-2     = 0.001) 
+   [216] occ = 0.00000 | (0-Dy-6pz      = 6.043) (7-Cl-3s       = 0.737) (6-Cl-3s       = 0.737) 
+   [217] occ = 0.00000 | (1-Dy-6pz      = 6.043) (10-Cl-3s       = 0.737) (11-Cl-3s       = 0.737) 
+   [218] occ = 0.00000 | (1-Dy-5f 3     = 1.044) (5-Cl-3s       = 0.014) (5-Cl-3px      = 0.011) 
+   [219] occ = 0.00000 | (1-Dy-5f-3     = 1.044) (3-Cl-3s       = 0.014) (3-Cl-3py      = 0.011) 
+   [220] occ = 0.00000 | (0-Dy-5f 3     = 1.044) (3-Cl-3s       = 0.014) (3-Cl-3px      = 0.011) 
+   [221] occ = 0.00000 | (0-Dy-5f-3     = 1.044) (5-Cl-3s       = 0.014) (5-Cl-3py      = 0.011) 
+   [222] occ = 0.00000 | (0-Dy-5dxz     = 1.175) (6-Cl-3px      = 0.028) (7-Cl-3px      = 0.028) 
+   [223] occ = 0.00000 | (0-Dy-5dyz     = 1.175) (6-Cl-3py      = 0.028) (7-Cl-3py      = 0.028) 
+   [224] occ = 0.00000 | (1-Dy-5dyz     = 1.175) (10-Cl-3py      = 0.028) (11-Cl-3py      = 0.028) 
+   [225] occ = 0.00000 | (1-Dy-5dxz     = 1.175) (10-Cl-3px      = 0.028) (11-Cl-3px      = 0.028) 
+   [226] occ = 0.00000 | (1-Dy-7px      = 2.265) (1-Dy-6px      = 0.720) (9-Cl-3s       = 0.276) 
+   [227] occ = 0.00000 | (1-Dy-7py      = 2.265) (1-Dy-6py      = 0.720) (8-Cl-3s       = 0.276) 
+   [228] occ = 0.00000 | (0-Dy-7px      = 2.265) (0-Dy-6px      = 0.720) (2-Cl-3s       = 0.276) 
+   [229] occ = 0.00000 | (0-Dy-7py      = 2.265) (0-Dy-6py      = 0.720) (4-Cl-3s       = 0.276) 
+   [230] occ = 0.00000 | (0-Dy-7pz      = 2.118) (0-Dy-6pz      = 0.581) (7-Cl-3s       = 0.270) 
+   [231] occ = 0.00000 | (1-Dy-7pz      = 2.118) (1-Dy-6pz      = 0.581) (10-Cl-3s       = 0.270) 
+   [232] occ = 0.00000 | (1-Dy-5f 1     = 1.033) (1-Dy-6px      = 0.007) (9-Cl-3s       = 0.007) 
+   [233] occ = 0.00000 | (1-Dy-5f-1     = 1.033) (1-Dy-6py      = 0.007) (8-Cl-3s       = 0.007) 
+   [234] occ = 0.00000 | (0-Dy-5f-1     = 1.033) (0-Dy-6py      = 0.007) (4-Cl-3s       = 0.007) 
+   [235] occ = 0.00000 | (0-Dy-5f 1     = 1.033) (0-Dy-6px      = 0.007) (2-Cl-3s       = 0.007) 
+   [236] occ = 0.00000 | (0-Dy-6dz^2    = 2.311) (6-Cl-3s       = 0.274) (7-Cl-3s       = 0.274) 
+   [237] occ = 0.00000 | (1-Dy-6dz^2    = 2.311) (10-Cl-3s       = 0.274) (11-Cl-3s       = 0.274) 
+   [238] occ = 0.00000 | (1-Dy-6dx2-y2  = 2.317) (3-Cl-3s       = 0.211) (5-Cl-3s       = 0.211) 
+   [239] occ = 0.00000 | (0-Dy-6dx2-y2  = 2.317) (5-Cl-3s       = 0.211) (3-Cl-3s       = 0.211) 
+   [240] occ = 0.00000 | (0-Dy-5f 0     = 1.055) (7-Cl-3s       = 0.018) (6-Cl-3s       = 0.018) 
+   [241] occ = 0.00000 | (1-Dy-5f 0     = 1.055) (10-Cl-3s       = 0.018) (11-Cl-3s       = 0.018) 
+   [242] occ = 0.00000 | (0-Dy-6dxy     = 1.514) (4-Cl-3px      = 0.047) (2-Cl-3py      = 0.047) 
+   [243] occ = 0.00000 | (1-Dy-6dxy     = 1.514) (9-Cl-3py      = 0.047) (8-Cl-3px      = 0.047) 
+   [244] occ = 0.00000 | (0-Dy-6dxz     = 1.440) (6-Cl-3px      = 0.047) (7-Cl-3px      = 0.047) 
+   [245] occ = 0.00000 | (0-Dy-6dyz     = 1.440) (6-Cl-3py      = 0.047) (7-Cl-3py      = 0.047) 
+   [246] occ = 0.00000 | (1-Dy-6dyz     = 1.440) (10-Cl-3py      = 0.047) (11-Cl-3py      = 0.047) 
+   [247] occ = 0.00000 | (1-Dy-6dxz     = 1.440) (10-Cl-3px      = 0.047) (11-Cl-3px      = 0.047) 
+cas list =  [148, 149, 150, 151, 153, 155, 156, 124, 127, 131, 125, 126, 130, 114, 123, 128, 129, 152, 154, 157]
+split localization at 0.1 ~ 1.9
+active occ =  29.99993502637582 [1.         1.         1.         1.         1.         1.
+ 1.         1.99999412 1.99999412 1.99999172 1.99999412 1.99999412
+ 1.99999172 1.9999946  1.99999419 1.99999401 1.9999923  1.
+ 1.         1.        ]
+low orbs =  []
+
+[pm_loc_kernel]
+ mocoeff.shape= (248, 0)
+ tol= 1e-06
+ maxcycle= 1000
+ partition= 12 \n [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58], [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117], [118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130], [131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143], [144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156], [157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169], [170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182], [183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195], [196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208], [209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221], [222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234], [235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247]]
+ initial funval =  0.0
+icycle= 0 delta= 0.0 fun= 0.0
+CONG: PMloc converged!
+mid orbs =  [ 0  1  2  3  4  5  6 17 18 19]
+
+[pm_loc_kernel]
+ mocoeff.shape= (248, 10)
+ tol= 1e-06
+ maxcycle= 1000
+ partition= 12 \n [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58], [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117], [118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130], [131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143], [144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156], [157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169], [170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182], [183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195], [196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208], [209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221], [222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234], [235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247]]
+ initial funval =  7.87063482717256
+icycle= 0 delta= 5.728293045836653e-13 fun= 7.870634827173133
+CONG: PMloc converged!
+high orbs =  [ 7  8  9 10 11 12 13 14 15 16]
+
+[pm_loc_kernel]
+ mocoeff.shape= (248, 10)
+ tol= 1e-06
+ maxcycle= 1000
+ partition= 12 \n [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58], [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117], [118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130], [131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143], [144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156], [157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169], [170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182], [183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195], [196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208], [209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221], [222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234], [235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247]]
+ initial funval =  7.529694188185411
+icycle= 0 delta= 3.5453863963416197e-12 fun= 7.529694188188957
+CONG: PMloc converged!
+NACTORB = 20 NACTELEC = 30 NCORE = 138
+Spherically averaged atomic HF for {'Dy', 'Cl'}
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF-RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /central/scratch/hczhai/soc-pyscf-tmp/tmp3vty9svj
+max_memory 100000 MB (current use 4550 MB)
+atom = Dy
+Set gradient conv threshold to 3.16228e-05
+init E= -10663.2077249146
+cycle= 1 E= -10690.3316345374  delta_E= -27.1  |g|=    0  |ddm|= 3.86
+cycle= 2 E= -10695.1729678745  delta_E= -4.84  |g|=    0  |ddm|=  4.8
+cycle= 3 E= -10704.9358234951  delta_E= -9.76  |g|=    0  |ddm|= 2.49
+cycle= 4 E= -10704.9544732764  delta_E= -0.0186  |g|=    0  |ddm|= 0.141
+cycle= 5 E= -10704.9567013852  delta_E= -0.00223  |g|=    0  |ddm|= 0.0434
+cycle= 6 E= -10704.9567340953  delta_E= -3.27e-05  |g|=    0  |ddm|= 0.00768
+cycle= 7 E= -10704.9567362389  delta_E= -2.14e-06  |g|=    0  |ddm|= 0.00215
+cycle= 8 E= -10704.9567362799  delta_E= -4.09e-08  |g|=    0  |ddm|= 0.000589
+cycle= 9 E= -10704.95673628  delta_E= -1.29e-10  |g|=    0  |ddm|= 3.23e-05
+Extra cycle  E= -10704.95673628  delta_E= -2e-11  |g|=    0  |ddm|= 3.8e-07
+Atomic HF for atom  Dy  converged. SCF energy = -10704.95673628
+
+
+******** <class 'pyscf.scf.atom_hf.AtomSphAverageRHF'> ********
+method = AtomSphAverageRHF-RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /central/scratch/hczhai/soc-pyscf-tmp/tmpjkf2ajvd
+max_memory 100000 MB (current use 4583 MB)
+atom = Cl
+Set gradient conv threshold to 3.16228e-05
+init E= -458.887636435305
+cycle= 1 E= -458.888650005697  delta_E= -0.00101  |g|=    0  |ddm|= 0.0495
+cycle= 2 E= -458.888686753693  delta_E= -3.67e-05  |g|=    0  |ddm|= 0.0127
+cycle= 3 E= -458.888689245199  delta_E= -2.49e-06  |g|=    0  |ddm|= 0.00273
+cycle= 4 E= -458.888689258122  delta_E= -1.29e-08  |g|=    0  |ddm|= 0.000175
+cycle= 5 E= -458.88868925833  delta_E= -2.08e-10  |g|=    0  |ddm|= 2.55e-05
+Extra cycle  E= -458.88868925833  delta_E= -3.41e-13  |g|=    0  |ddm|= 1.6e-07
+Atomic HF for atom  Cl  converged. SCF energy = -458.88868925833
+ ** Mulliken pop            alpha | beta         magnetism **
+pop of  0 Dy 1s           0.99992 | 0.99992        0.00000
+pop of  0 Dy 2s           0.99905 | 0.99897        0.00009
+pop of  0 Dy 3s           0.99002 | 0.98958        0.00044
+pop of  0 Dy 4s           0.89303 | 0.88133        0.01171
+pop of  0 Dy 5s           0.27371 | 0.23763        0.03607
+pop of  0 Dy 6s           0.32893 | 0.27385        0.05508
+pop of  0 Dy 7s           0.90188 | 0.89483        0.00705
+pop of  0 Dy 2px          0.99994 | 0.99994        0.00000
+pop of  0 Dy 2py          0.99994 | 0.99994        0.00000
+pop of  0 Dy 2pz          0.99994 | 0.99994        0.00000
+pop of  0 Dy 3px          0.99973 | 0.99973        0.00001
+pop of  0 Dy 3py          0.99973 | 0.99973        0.00001
+pop of  0 Dy 3pz          0.99973 | 0.99973        0.00001
+pop of  0 Dy 4px          0.99743 | 0.99735        0.00008
+pop of  0 Dy 4py          0.99743 | 0.99735        0.00008
+pop of  0 Dy 4pz          0.99748 | 0.99740        0.00008
+pop of  0 Dy 5px          0.90718 | 0.89235        0.01483
+pop of  0 Dy 5py          0.90718 | 0.89235        0.01483
+pop of  0 Dy 5pz          0.91144 | 0.89638        0.01506
+pop of  0 Dy 6px          0.28907 | 0.23401        0.05505
+pop of  0 Dy 6py          0.28907 | 0.23401        0.05505
+pop of  0 Dy 6pz          0.30182 | 0.24344        0.05838
+pop of  0 Dy 7px          0.04783 | 0.03807        0.00976
+pop of  0 Dy 7py          0.04783 | 0.03807        0.00976
+pop of  0 Dy 7pz          0.04515 | 0.03657        0.00858
+pop of  0 Dy 3dxy         1.00000 | 1.00000       -0.00000
+pop of  0 Dy 3dyz         1.00000 | 1.00000       -0.00000
+pop of  0 Dy 3dz^2        1.00000 | 1.00000       -0.00000
+pop of  0 Dy 3dxz         1.00000 | 1.00000       -0.00000
+pop of  0 Dy 3dx2-y2      1.00000 | 1.00000       -0.00000
+pop of  0 Dy 4dxy         0.99998 | 0.99998        0.00000
+pop of  0 Dy 4dyz         0.99999 | 0.99999        0.00000
+pop of  0 Dy 4dz^2        0.99994 | 0.99994        0.00000
+pop of  0 Dy 4dxz         0.99999 | 0.99999        0.00000
+pop of  0 Dy 4dx2-y2      0.99994 | 0.99994        0.00000
+pop of  0 Dy 5dxy         0.36008 | 0.24051        0.11957
+pop of  0 Dy 5dyz         0.36482 | 0.24306        0.12177
+pop of  0 Dy 5dz^2        0.35050 | 0.26308        0.08743
+pop of  0 Dy 5dxz         0.36482 | 0.24306        0.12177
+pop of  0 Dy 5dx2-y2      0.34920 | 0.26145        0.08775
+pop of  0 Dy 6dxy         0.04341 | 0.02929        0.01412
+pop of  0 Dy 6dyz         0.04120 | 0.02792        0.01328
+pop of  0 Dy 6dz^2        0.08552 | 0.06506        0.02046
+pop of  0 Dy 6dxz         0.04120 | 0.02792        0.01328
+pop of  0 Dy 6dx2-y2      0.08234 | 0.06257        0.01977
+pop of  0 Dy 4f-3         0.69390 | 0.52650        0.16740
+pop of  0 Dy 4f-2         0.69353 | 0.52589        0.16763
+pop of  0 Dy 4f-1         0.69388 | 0.52641        0.16746
+pop of  0 Dy 4f 0         0.69388 | 0.52652        0.16736
+pop of  0 Dy 4f 1         0.69388 | 0.52641        0.16746
+pop of  0 Dy 4f 2         0.69389 | 0.52637        0.16752
+pop of  0 Dy 4f 3         0.69390 | 0.52650        0.16740
+pop of  0 Dy 5f-3         0.00867 | 0.00729        0.00139
+pop of  0 Dy 5f-2         0.00085 | 0.00066        0.00019
+pop of  0 Dy 5f-1         0.00655 | 0.00548        0.00107
+pop of  0 Dy 5f 0         0.01119 | 0.00952        0.00167
+pop of  0 Dy 5f 1         0.00655 | 0.00548        0.00107
+pop of  0 Dy 5f 2         0.00372 | 0.00305        0.00066
+pop of  0 Dy 5f 3         0.00867 | 0.00729        0.00139
+pop of  1 Dy 1s           0.99992 | 0.99992        0.00000
+pop of  1 Dy 2s           0.99905 | 0.99897        0.00009
+pop of  1 Dy 3s           0.99002 | 0.98958        0.00044
+pop of  1 Dy 4s           0.89303 | 0.88133        0.01171
+pop of  1 Dy 5s           0.27371 | 0.23763        0.03607
+pop of  1 Dy 6s           0.32893 | 0.27385        0.05508
+pop of  1 Dy 7s           0.90188 | 0.89483        0.00705
+pop of  1 Dy 2px          0.99994 | 0.99994        0.00000
+pop of  1 Dy 2py          0.99994 | 0.99994        0.00000
+pop of  1 Dy 2pz          0.99994 | 0.99994        0.00000
+pop of  1 Dy 3px          0.99973 | 0.99973        0.00001
+pop of  1 Dy 3py          0.99973 | 0.99973        0.00001
+pop of  1 Dy 3pz          0.99973 | 0.99973        0.00001
+pop of  1 Dy 4px          0.99743 | 0.99735        0.00008
+pop of  1 Dy 4py          0.99743 | 0.99735        0.00008
+pop of  1 Dy 4pz          0.99748 | 0.99740        0.00008
+pop of  1 Dy 5px          0.90718 | 0.89235        0.01483
+pop of  1 Dy 5py          0.90718 | 0.89235        0.01483
+pop of  1 Dy 5pz          0.91144 | 0.89638        0.01506
+pop of  1 Dy 6px          0.28907 | 0.23401        0.05505
+pop of  1 Dy 6py          0.28907 | 0.23401        0.05505
+pop of  1 Dy 6pz          0.30182 | 0.24344        0.05838
+pop of  1 Dy 7px          0.04783 | 0.03807        0.00976
+pop of  1 Dy 7py          0.04783 | 0.03807        0.00976
+pop of  1 Dy 7pz          0.04515 | 0.03657        0.00858
+pop of  1 Dy 3dxy         1.00000 | 1.00000       -0.00000
+pop of  1 Dy 3dyz         1.00000 | 1.00000       -0.00000
+pop of  1 Dy 3dz^2        1.00000 | 1.00000       -0.00000
+pop of  1 Dy 3dxz         1.00000 | 1.00000       -0.00000
+pop of  1 Dy 3dx2-y2      1.00000 | 1.00000       -0.00000
+pop of  1 Dy 4dxy         0.99998 | 0.99998        0.00000
+pop of  1 Dy 4dyz         0.99999 | 0.99999        0.00000
+pop of  1 Dy 4dz^2        0.99994 | 0.99994        0.00000
+pop of  1 Dy 4dxz         0.99999 | 0.99999        0.00000
+pop of  1 Dy 4dx2-y2      0.99994 | 0.99994        0.00000
+pop of  1 Dy 5dxy         0.36008 | 0.24051        0.11957
+pop of  1 Dy 5dyz         0.36482 | 0.24306        0.12177
+pop of  1 Dy 5dz^2        0.35050 | 0.26308        0.08743
+pop of  1 Dy 5dxz         0.36482 | 0.24306        0.12177
+pop of  1 Dy 5dx2-y2      0.34920 | 0.26145        0.08775
+pop of  1 Dy 6dxy         0.04341 | 0.02929        0.01412
+pop of  1 Dy 6dyz         0.04120 | 0.02792        0.01328
+pop of  1 Dy 6dz^2        0.08552 | 0.06506        0.02046
+pop of  1 Dy 6dxz         0.04120 | 0.02792        0.01328
+pop of  1 Dy 6dx2-y2      0.08234 | 0.06257        0.01977
+pop of  1 Dy 4f-3         0.69390 | 0.52650        0.16740
+pop of  1 Dy 4f-2         0.69353 | 0.52589        0.16763
+pop of  1 Dy 4f-1         0.69388 | 0.52641        0.16746
+pop of  1 Dy 4f 0         0.69388 | 0.52652        0.16736
+pop of  1 Dy 4f 1         0.69388 | 0.52641        0.16746
+pop of  1 Dy 4f 2         0.69389 | 0.52637        0.16752
+pop of  1 Dy 4f 3         0.69390 | 0.52650        0.16740
+pop of  1 Dy 5f-3         0.00867 | 0.00729        0.00139
+pop of  1 Dy 5f-2         0.00085 | 0.00066        0.00019
+pop of  1 Dy 5f-1         0.00655 | 0.00548        0.00107
+pop of  1 Dy 5f 0         0.01119 | 0.00952        0.00167
+pop of  1 Dy 5f 1         0.00655 | 0.00548        0.00107
+pop of  1 Dy 5f 2         0.00372 | 0.00305        0.00066
+pop of  1 Dy 5f 3         0.00867 | 0.00729        0.00139
+pop of  2 Cl 1s           0.99993 | 0.99992        0.00000
+pop of  2 Cl 2s           0.99499 | 0.99483        0.00016
+pop of  2 Cl 3s           0.86724 | 0.84446        0.02279
+pop of  2 Cl 4s           0.13429 | 0.09124        0.04305
+pop of  2 Cl 2px          0.99979 | 0.99977        0.00001
+pop of  2 Cl 2py          0.99993 | 0.99993        0.00000
+pop of  2 Cl 2pz          0.99993 | 0.99993        0.00000
+pop of  2 Cl 3px          0.75605 | 0.65189        0.10416
+pop of  2 Cl 3py          0.77932 | 0.66844        0.11087
+pop of  2 Cl 3pz          0.77962 | 0.66878        0.11083
+pop of  2 Cl 4px          0.19546 | 0.12932        0.06614
+pop of  2 Cl 4py          0.16989 | 0.10519        0.06470
+pop of  2 Cl 4pz          0.17001 | 0.10511        0.06489
+pop of  3 Cl 1s           0.99988 | 0.99987        0.00000
+pop of  3 Cl 2s           0.99177 | 0.99149        0.00027
+pop of  3 Cl 3s           0.80299 | 0.77891        0.02408
+pop of  3 Cl 4s           0.12580 | 0.09005        0.03575
+pop of  3 Cl 2px          0.99972 | 0.99971        0.00001
+pop of  3 Cl 2py          0.99972 | 0.99971        0.00001
+pop of  3 Cl 2pz          0.99989 | 0.99989        0.00001
+pop of  3 Cl 3px          0.73060 | 0.62930        0.10130
+pop of  3 Cl 3py          0.73060 | 0.62930        0.10130
+pop of  3 Cl 3pz          0.76085 | 0.65202        0.10883
+pop of  3 Cl 4px          0.16015 | 0.10983        0.05032
+pop of  3 Cl 4py          0.16015 | 0.10983        0.05032
+pop of  3 Cl 4pz          0.14413 | 0.09080        0.05334
+pop of  4 Cl 1s           0.99993 | 0.99992        0.00000
+pop of  4 Cl 2s           0.99499 | 0.99483        0.00016
+pop of  4 Cl 3s           0.86724 | 0.84446        0.02279
+pop of  4 Cl 4s           0.13429 | 0.09124        0.04305
+pop of  4 Cl 2px          0.99993 | 0.99993        0.00000
+pop of  4 Cl 2py          0.99979 | 0.99977        0.00001
+pop of  4 Cl 2pz          0.99993 | 0.99993        0.00000
+pop of  4 Cl 3px          0.77932 | 0.66844        0.11087
+pop of  4 Cl 3py          0.75605 | 0.65189        0.10416
+pop of  4 Cl 3pz          0.77962 | 0.66878        0.11083
+pop of  4 Cl 4px          0.16989 | 0.10519        0.06470
+pop of  4 Cl 4py          0.19546 | 0.12932        0.06614
+pop of  4 Cl 4pz          0.17001 | 0.10511        0.06489
+pop of  5 Cl 1s           0.99988 | 0.99987        0.00000
+pop of  5 Cl 2s           0.99177 | 0.99149        0.00027
+pop of  5 Cl 3s           0.80299 | 0.77891        0.02408
+pop of  5 Cl 4s           0.12580 | 0.09005        0.03575
+pop of  5 Cl 2px          0.99972 | 0.99971        0.00001
+pop of  5 Cl 2py          0.99972 | 0.99971        0.00001
+pop of  5 Cl 2pz          0.99989 | 0.99989        0.00001
+pop of  5 Cl 3px          0.73060 | 0.62930        0.10130
+pop of  5 Cl 3py          0.73060 | 0.62930        0.10130
+pop of  5 Cl 3pz          0.76085 | 0.65202        0.10883
+pop of  5 Cl 4px          0.16015 | 0.10983        0.05032
+pop of  5 Cl 4py          0.16015 | 0.10983        0.05032
+pop of  5 Cl 4pz          0.14413 | 0.09080        0.05334
+pop of  6 Cl 1s           0.99993 | 0.99992        0.00000
+pop of  6 Cl 2s           0.99494 | 0.99478        0.00016
+pop of  6 Cl 3s           0.86529 | 0.84234        0.02295
+pop of  6 Cl 4s           0.12921 | 0.08778        0.04143
+pop of  6 Cl 2px          0.99993 | 0.99993        0.00000
+pop of  6 Cl 2py          0.99993 | 0.99993        0.00000
+pop of  6 Cl 2pz          0.99978 | 0.99977        0.00001
+pop of  6 Cl 3px          0.77455 | 0.66340        0.11116
+pop of  6 Cl 3py          0.77455 | 0.66340        0.11116
+pop of  6 Cl 3pz          0.75245 | 0.64777        0.10468
+pop of  6 Cl 4px          0.15913 | 0.09923        0.05990
+pop of  6 Cl 4py          0.15913 | 0.09923        0.05990
+pop of  6 Cl 4pz          0.18641 | 0.12361        0.06281
+pop of  7 Cl 1s           0.99993 | 0.99992        0.00000
+pop of  7 Cl 2s           0.99494 | 0.99478        0.00016
+pop of  7 Cl 3s           0.86529 | 0.84234        0.02295
+pop of  7 Cl 4s           0.12921 | 0.08778        0.04143
+pop of  7 Cl 2px          0.99993 | 0.99993        0.00000
+pop of  7 Cl 2py          0.99993 | 0.99993        0.00000
+pop of  7 Cl 2pz          0.99978 | 0.99977        0.00001
+pop of  7 Cl 3px          0.77455 | 0.66340        0.11116
+pop of  7 Cl 3py          0.77455 | 0.66340        0.11116
+pop of  7 Cl 3pz          0.75245 | 0.64777        0.10468
+pop of  7 Cl 4px          0.15913 | 0.09923        0.05990
+pop of  7 Cl 4py          0.15913 | 0.09923        0.05990
+pop of  7 Cl 4pz          0.18641 | 0.12361        0.06281
+pop of  8 Cl 1s           0.99993 | 0.99992        0.00000
+pop of  8 Cl 2s           0.99499 | 0.99483        0.00016
+pop of  8 Cl 3s           0.86724 | 0.84446        0.02279
+pop of  8 Cl 4s           0.13429 | 0.09124        0.04305
+pop of  8 Cl 2px          0.99993 | 0.99993        0.00000
+pop of  8 Cl 2py          0.99979 | 0.99977        0.00001
+pop of  8 Cl 2pz          0.99993 | 0.99993        0.00000
+pop of  8 Cl 3px          0.77932 | 0.66844        0.11087
+pop of  8 Cl 3py          0.75605 | 0.65189        0.10416
+pop of  8 Cl 3pz          0.77962 | 0.66878        0.11083
+pop of  8 Cl 4px          0.16989 | 0.10519        0.06470
+pop of  8 Cl 4py          0.19546 | 0.12932        0.06614
+pop of  8 Cl 4pz          0.17001 | 0.10511        0.06489
+pop of  9 Cl 1s           0.99993 | 0.99992        0.00000
+pop of  9 Cl 2s           0.99499 | 0.99483        0.00016
+pop of  9 Cl 3s           0.86724 | 0.84446        0.02279
+pop of  9 Cl 4s           0.13429 | 0.09124        0.04305
+pop of  9 Cl 2px          0.99979 | 0.99977        0.00001
+pop of  9 Cl 2py          0.99993 | 0.99993        0.00000
+pop of  9 Cl 2pz          0.99993 | 0.99993        0.00000
+pop of  9 Cl 3px          0.75605 | 0.65189        0.10416
+pop of  9 Cl 3py          0.77932 | 0.66844        0.11087
+pop of  9 Cl 3pz          0.77962 | 0.66878        0.11083
+pop of  9 Cl 4px          0.19546 | 0.12932        0.06614
+pop of  9 Cl 4py          0.16989 | 0.10519        0.06470
+pop of  9 Cl 4pz          0.17001 | 0.10511        0.06489
+pop of  10 Cl 1s          0.99993 | 0.99992        0.00000
+pop of  10 Cl 2s          0.99494 | 0.99478        0.00016
+pop of  10 Cl 3s          0.86529 | 0.84234        0.02295
+pop of  10 Cl 4s          0.12921 | 0.08778        0.04143
+pop of  10 Cl 2px         0.99993 | 0.99993        0.00000
+pop of  10 Cl 2py         0.99993 | 0.99993        0.00000
+pop of  10 Cl 2pz         0.99978 | 0.99977        0.00001
+pop of  10 Cl 3px         0.77455 | 0.66340        0.11116
+pop of  10 Cl 3py         0.77455 | 0.66340        0.11116
+pop of  10 Cl 3pz         0.75245 | 0.64777        0.10468
+pop of  10 Cl 4px         0.15913 | 0.09923        0.05990
+pop of  10 Cl 4py         0.15913 | 0.09923        0.05990
+pop of  10 Cl 4pz         0.18641 | 0.12361        0.06281
+pop of  11 Cl 1s          0.99993 | 0.99992        0.00000
+pop of  11 Cl 2s          0.99494 | 0.99478        0.00016
+pop of  11 Cl 3s          0.86529 | 0.84234        0.02295
+pop of  11 Cl 4s          0.12921 | 0.08778        0.04143
+pop of  11 Cl 2px         0.99993 | 0.99993        0.00000
+pop of  11 Cl 2py         0.99993 | 0.99993        0.00000
+pop of  11 Cl 2pz         0.99978 | 0.99977        0.00001
+pop of  11 Cl 3px         0.77455 | 0.66340        0.11116
+pop of  11 Cl 3py         0.77455 | 0.66340        0.11116
+pop of  11 Cl 3pz         0.75245 | 0.64777        0.10468
+pop of  11 Cl 4px         0.15913 | 0.09923        0.05990
+pop of  11 Cl 4py         0.15913 | 0.09923        0.05990
+pop of  11 Cl 4pz         0.18641 | 0.12361        0.06281
+In total                158.00000 | 148.00000     10.00000
+ ** Mulliken atomic charges    ( Nelec_alpha | Nelec_beta )    magnetism **
+charge of    0Dy =     -2.06995  (    35.11042     32.95953 )      2.15090
+charge of    1Dy =     -2.06995  (    35.11042     32.95953 )      2.15090
+charge of    2Cl =     -0.10526  (     8.84644      8.25882 )      0.58762
+charge of    3Cl =      0.31304  (     8.60625      8.08071 )      0.52554
+charge of    4Cl =     -0.10526  (     8.84644      8.25882 )      0.58762
+charge of    5Cl =      0.31304  (     8.60625      8.08071 )      0.52554
+charge of    6Cl =     -0.01628  (     8.79522      8.22106 )      0.57416
+charge of    7Cl =     -0.01628  (     8.79522      8.22106 )      0.57416
+charge of    8Cl =     -0.10526  (     8.84644      8.25882 )      0.58762
+charge of    9Cl =     -0.10526  (     8.84644      8.25882 )      0.58762
+charge of   10Cl =     -0.01628  (     8.79522      8.22106 )      0.57416
+charge of   11Cl =     -0.01628  (     8.79522      8.22106 )      0.57416
+ncore =  138  ncas =  20
+reordering =  [33 31 19 25 23 21  3 29  7 27  9  5 39 13 37 15  1 17 11 35 34 10 16  0
+ 14 36 12 38  4  8 26  6 28  2 20 22 24 18 30 32]
+MF FINISH TIME =  09/03/2022 03:57:17
+MF TIME  =              231.515

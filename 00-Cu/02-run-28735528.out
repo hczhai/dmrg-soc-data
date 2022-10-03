@@ -1,0 +1,2257 @@
+START TIME =  10/03/2022 12:32:35
+MPI INIT: rank 0 of 1
+#INFO: **** input file is /central/groups/changroup/members/hczhai/work/soc-proj-data-final/00-Cu/02-cu-11o-bp-2step.py ****
+
+import time
+from datetime import datetime
+txst = time.perf_counter()
+print("START TIME = ", datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
+
+from pyscf import scf, mcscf, gto
+from pyscf.data import nist
+from pyblock2._pyscf import mcscf as b2mcscf
+from pyblock2.driver.core import SOCDMRGDriver, SymmetryTypes
+from pyblock2._pyscf.ao2mo import soc_integrals as itgsoc
+from pyblock2._pyscf.ao2mo import integrals as itg
+import numpy as np
+import pickle
+
+fidx = 2
+
+driver = SOCDMRGDriver(
+    scratch="/central/scratch/hczhai/soc-00-%02d" % fidx, symm_type=SymmetryTypes.SU2, n_threads=24,
+    stack_mem=int(40E9), mpi=True
+)
+
+if driver.mpi.rank == driver.mpi.root:
+
+    mol = gto.M(atom="Cu 0 0 0", basis="ano@6s5p3d2f", verbose=4, spin=1, max_memory=100000)
+    print('basis = ano@6s5p3d2f nelec = %d nao = %d' % (mol.nelectron, mol.nao))
+    mf = scf.RHF(mol).x2c().run(conv_tol=1e-14)
+    dmao = np.einsum('yij->ij', mf.make_rdm1(), optimize=True)
+
+    selected = b2mcscf.select_active_space(
+        mol, mf.mo_coeff, mf.mo_occ, ao_labels=['Cu-3d', 'Cu-4d', 'Cu-4s'], atom_order=[0]
+    )
+    mf.mo_coeff, mf.mo_occ, mf.mo_energy, ncas, ncaselec = b2mcscf.sort_orbitals(
+        mol,
+        mf.mo_coeff,
+        mf.mo_occ,
+        mf.mo_energy,
+        cas_list=selected,
+        do_loc=True,
+        split_low=0.1,
+        split_high=1.9,
+    )
+
+    mc = mcscf.CASSCF(mf, ncas, ncaselec).state_average_((0.5, 0.1, 0.1, 0.1, 0.1, 0.1))
+    mc.kernel()
+    mf.mo_coeff = mc.mo_coeff
+
+    ncore = mc.ncore
+    ncas = mc.ncas
+    print('ncore = ', ncore, ' ncas = ', ncas)
+
+    np.save('%02d-mo_coeff.npy' % fidx, mf.mo_coeff)
+
+    ncas, n_elec, spin, ecore, h1e, g2e, orb_sym = itg.get_rhf_integrals(mf, ncore, ncas, pg_symm=False)
+    hsoao = itgsoc.get_somf_hsoao(mf, dmao=dmao, amfi=True, x2c1e=False, x2c2e=False)
+    hso = np.einsum('rij,ip,jq->rpq', hsoao,
+        mf.mo_coeff[:, ncore:ncore + ncas],
+        mf.mo_coeff[:, ncore:ncore + ncas], optimize=True)
+
+    idx = driver.orbital_reordering(np.abs(h1e), np.abs(g2e))
+    print('reordering = ', idx)
+    h1e = h1e[idx][:, idx]
+    g2e = g2e[idx][:, idx][:, :, idx][:, :, :, idx]
+
+    pickle.dump((ncas, n_elec, spin, ecore, h1e, g2e, orb_sym, hso, idx), open("%02d-mf-data.bin" % fidx, "wb"))
+
+driver.mpi.barrier()
+ncas, n_elec, spin, ecore, h1e, g2e, orb_sym, hso, idx = pickle.load(open("%02d-mf-data.bin" % fidx, "rb"))
+
+txed = time.perf_counter()
+print("MF FINISH TIME = ", datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
+print("MF TIME  = %20.3f" % (txed - txst))
+txst = txed
+
+driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin, orb_sym=orb_sym, singlet_embedding=False)
+h1e[np.abs(h1e) < 1e-10] = 0
+g2e[np.abs(g2e) < 1e-10] = 0
+
+nroots = 6
+mpo = driver.get_qc_mpo(h1e=h1e, g2e=g2e, ecore=ecore, iprint=1)
+ket = driver.get_random_mps(tag="KET", bond_dim=250, nroots=nroots)
+
+bond_dims = [500] * 5 + [1000] * 5 + [1500] * 5
+noises = [1e-4] * 5 + [1e-5] * 5 + [1e-6] * 5 + [0]
+thrds = [1e-5] * 5 + [1e-5] * 5 + [1e-7] * 5 + [1E-8]
+energies = driver.dmrg(
+    mpo,
+    ket,
+    n_sweeps=20,
+    bond_dims=bond_dims,
+    noises=noises,
+    thrds=thrds,
+    iprint=2,
+    dav_max_iter=400,
+    cutoff=1E-24
+)
+
+driver.reorder_idx = idx
+
+skets = []
+for i in range(len(energies)):
+    sket = driver.split_mps(ket, i, "SKET%d" % i)
+    if driver.mpi.rank == driver.mpi.root:
+        print('split mps = ', i)
+    skets.append(sket)
+
+txed = time.perf_counter()
+print("DMRG FINISH TIME = ", datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
+print("DMRG TIME  = %20.3f" % (txed - txst))
+txst = txed
+
+pdms_dict = {}
+for i, iket in enumerate(skets):
+    for j, jket in enumerate(skets):
+        if i < j:
+            continue
+        if driver.mpi.rank == driver.mpi.root:
+            print('compute pdm = ', i, j)
+        dm = driver.get_trans_1pdm(iket, jket, soc=True, iprint=2)
+        pdms_dict[(i, j)] = dm
+
+txed = time.perf_counter()
+print("1PDM FINISH TIME = ", datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
+print("1PDM TIME  = %20.3f" % (txed - txst))
+txst = txed
+
+all_eners = [energies]
+twoss = [1]
+hsomo = hso
+
+energies = driver.soc_two_step(all_eners, twoss, pdms_dict, hsomo, iprint=1)
+
+au2cm = nist.HARTREE2J / nist.PLANCK / nist.LIGHT_SPEED_SI * 1e-2
+
+e0 = np.average(energies[0:2])
+e1 = np.average(energies[2:8])
+e2 = np.average(energies[8:12])
+
+au2ev = 27.21139
+
+if driver.mpi.rank == driver.mpi.root:
+    print("")
+    print("E 2D(5/2)         = %10.4f eV" % ((e1 - e0) * au2ev))
+    print("E 2D(3/2)         = %10.4f eV" % ((e2 - e0) * au2ev))
+    print("2D(5/2) - 2D(3/2) = %10.4f eV" % ((e2 - e1) * au2ev))
+
+driver.finalize()
+
+txed = time.perf_counter()
+print("DIAG FINISH TIME = ", datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
+print("DIAG TIME  = %20.3f" % (txed - txst))
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='hpc-21-22.cm.cluster', release='3.10.0-1160.53.1.el7.x86_64', version='#1 SMP Fri Jan 14 13:59:45 UTC 2022', machine='x86_64', processor='x86_64')  Threads 24
+Python 3.8.5 (default, Sep  4 2020, 07:30:14) 
+[GCC 7.3.0]
+numpy 1.19.4  scipy 1.4.1
+Date: Mon Oct  3 12:32:35 2022
+PySCF version 2.0.1
+PySCF path  /central/groups/changroup/members/hczhai/program/pyscf
+GIT HEAD (branch master) 9d5b5bd309d1cc55fbd1a0ec76e26b5b0c7f76af
+
+[ENV] PYSCF_TMPDIR /central/scratch/hczhai/soc-pyscf-tmp
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 1
+[INPUT] num. electrons = 29
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 1
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT]  1 Cu     0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr
+
+nuclear repulsion = 0
+number of shells = 4
+number of NR pGTOs = 158
+number of NR cGTOs = 50
+basis = ano@6s5p3d2f
+ecp = {}
+CPU time:         0.62
+basis = ano@6s5p3d2f nelec = 29 nao = 50
+
+
+******** <class 'pyscf.x2c.sfx2c1e.sfx2c1e.<locals>.SFX2C1E_SCF'> ********
+method = SFX2C1E_SCF-ROHF-RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-14
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /central/scratch/hczhai/soc-pyscf-tmp/tmp1o359ybg
+max_memory 100000 MB (current use 137 MB)
+num. doubly occ = 14  num. singly occ = 1
+
+
+******** <class 'pyscf.x2c.sfx2c1e.SpinFreeX2CHelper'> ********
+approx = 1e
+xuncontract = 1
+Set gradient conv threshold to 1e-07
+init E= -1653.06271063991
+  HOMO = -0.0986491648214323  LUMO = 0.134869510217794
+cycle= 1 E= -1653.10921938308  delta_E= -0.0465  |g|= 0.826  |ddm|= 0.761
+  HOMO = -0.134330151244334  LUMO = 0.108588840460337
+cycle= 2 E= -1653.07682941878  delta_E= 0.0324  |g|= 1.14  |ddm|= 0.371
+  HOMO = -0.114132723873263  LUMO = 0.120352957732705
+cycle= 3 E= -1653.15609568225  delta_E= -0.0793  |g|= 0.0301  |ddm|= 0.177
+  HOMO = -0.108337263406131  LUMO = 0.124918432602697
+cycle= 4 E= -1653.15622185644  delta_E= -0.000126  |g|= 0.00424  |ddm|= 0.0147
+  HOMO = -0.106565689462914  LUMO = 0.126349021582197
+cycle= 5 E= -1653.15623018414  delta_E= -8.33e-06  |g|= 0.000788  |ddm|= 0.0068
+  HOMO = -0.106028212787231  LUMO = 0.126756449507884
+cycle= 6 E= -1653.15623057632  delta_E= -3.92e-07  |g|= 6.45e-05  |ddm|= 0.00183
+  HOMO = -0.10604989299781  LUMO = 0.126741145872227
+cycle= 7 E= -1653.15623057691  delta_E= -5.89e-10  |g|= 1.05e-06  |ddm|= 4.91e-05
+  HOMO = -0.10604972124968  LUMO = 0.126741148558092
+cycle= 8 E= -1653.15623057691  delta_E= 6.82e-13  |g|= 1.14e-07  |ddm|= 1.14e-06
+  HOMO = -0.106049740428413  LUMO = 0.12674113818073
+cycle= 9 E= -1653.15623057691  delta_E= -1.36e-12  |g|= 2.09e-09  |ddm|= 2.27e-08
+  HOMO = -0.106049740168412  LUMO = 0.126741138264716
+cycle= 10 E= -1653.15623057691  delta_E= 4.55e-13  |g|= 6.97e-10  |ddm|= 5.03e-10
+  HOMO = -0.106049739409089  LUMO = 0.126741138840183
+cycle= 11 E= -1653.15623057691  delta_E= -1.59e-12  |g|= 9.6e-10  |ddm|= 2.37e-09
+  HOMO = -0.106049739368814  LUMO = 0.126741138899586
+cycle= 12 E= -1653.15623057691  delta_E= 6.82e-13  |g|= 6.71e-10  |ddm|= 5.48e-10
+  HOMO = -0.10604974021962  LUMO = 0.126741138269926
+cycle= 13 E= -1653.15623057691  delta_E= 2.27e-13  |g|= 1.86e-09  |ddm|= 2.23e-09
+  HOMO = -0.106049740523576  LUMO = 0.126741138031292
+cycle= 14 E= -1653.15623057691  delta_E=    0  |g|= 7.86e-10  |ddm|= 1.42e-09
+  HOMO = -0.106049740030827  LUMO = 0.126741138394513
+Extra cycle  E= -1653.15623057691  delta_E= 6.82e-13  |g|= 5.17e-10  |ddm|= 1.57e-09
+converged SCF energy = -1653.15623057691
+   [  0] occ = 2.00000 | (0-Cu-1s       = 1.000) (0-Cu-2s       = 0.000) (0-Cu-6s       = 0.000) 
+   [  1] occ = 2.00000 | (0-Cu-2s       = 1.000) (0-Cu-6s       = 0.000) (0-Cu-3s       = 0.000) 
+   [  2] occ = 2.00000 | (0-Cu-2py      = 0.473) (0-Cu-2pz      = 0.438) (0-Cu-2px      = 0.089) 
+   [  3] occ = 2.00000 | (0-Cu-2py      = 0.505) (0-Cu-2pz      = 0.281) (0-Cu-2px      = 0.214) 
+   [  4] occ = 2.00000 | (0-Cu-2px      = 0.697) (0-Cu-2pz      = 0.281) (0-Cu-2py      = 0.022) 
+   [  5] occ = 2.00000 | (0-Cu-3s       = 1.000) (0-Cu-6s       = 0.000) (0-Cu-5s       = 0.000) 
+   [  6] occ = 2.00000 | (0-Cu-3pz      = 0.553) (0-Cu-3px      = 0.397) (0-Cu-3py      = 0.050) 
+   [  7] occ = 2.00000 | (0-Cu-3px      = 0.591) (0-Cu-3pz      = 0.407) (0-Cu-3py      = 0.002) 
+   [  8] occ = 2.00000 | (0-Cu-3py      = 0.948) (0-Cu-3pz      = 0.040) (0-Cu-3px      = 0.012) 
+ * [  9] occ = 2.00000 | (0-Cu-3dxz     = 0.803) (0-Cu-3dz^2    = 0.181) (0-Cu-3dxy     = 0.015) 
+ * [ 10] occ = 2.00000 | (0-Cu-3dz^2    = 0.352) (0-Cu-3dyz     = 0.311) (0-Cu-3dxy     = 0.156) 
+ * [ 11] occ = 2.00000 | (0-Cu-3dx2-y2  = 0.724) (0-Cu-3dxy     = 0.125) (0-Cu-3dz^2    = 0.096) 
+ * [ 12] occ = 2.00000 | (0-Cu-3dyz     = 0.416) (0-Cu-3dz^2    = 0.370) (0-Cu-3dxy     = 0.114) 
+ * [ 13] occ = 2.00000 | (0-Cu-3dxy     = 0.590) (0-Cu-3dyz     = 0.225) (0-Cu-3dx2-y2  = 0.174) 
+ * [ 14] occ = 1.00000 | (0-Cu-4s       = 0.997) (0-Cu-5s       = 0.003) (0-Cu-6s       = 0.000) 
+   [ 15] occ = 0.00000 | (0-Cu-4py      = 0.550) (0-Cu-4px      = 0.270) (0-Cu-5py      = 0.077) 
+   [ 16] occ = 0.00000 | (0-Cu-4pz      = 0.668) (0-Cu-5pz      = 0.093) (0-Cu-4py      = 0.087) 
+   [ 17] occ = 0.00000 | (0-Cu-4px      = 0.485) (0-Cu-4py      = 0.192) (0-Cu-4pz      = 0.151) 
+   [ 18] occ = 0.00000 | (0-Cu-5s       = 0.981) (0-Cu-6s       = 0.015) (0-Cu-4s       = 0.003) 
+   [ 19] occ = 0.00000 | (0-Cu-6py      = 0.369) (0-Cu-5py      = 0.321) (0-Cu-4py      = 0.136) 
+   [ 20] occ = 0.00000 | (0-Cu-6px      = 0.380) (0-Cu-5px      = 0.330) (0-Cu-4px      = 0.140) 
+   [ 21] occ = 0.00000 | (0-Cu-6pz      = 0.426) (0-Cu-5pz      = 0.370) (0-Cu-4pz      = 0.157) 
+ * [ 22] occ = 0.00000 | (0-Cu-4dx2-y2  = 0.380) (0-Cu-4dxy     = 0.356) (0-Cu-5dx2-y2  = 0.121) 
+ * [ 23] occ = 0.00000 | (0-Cu-4dyz     = 0.512) (0-Cu-5dyz     = 0.164) (0-Cu-4dxz     = 0.142) 
+ * [ 24] occ = 0.00000 | (0-Cu-4dz^2    = 0.738) (0-Cu-5dz^2    = 0.236) (0-Cu-4dxz     = 0.012) 
+ * [ 25] occ = 0.00000 | (0-Cu-4dxz     = 0.573) (0-Cu-5dxz     = 0.183) (0-Cu-4dyz     = 0.165) 
+ * [ 26] occ = 0.00000 | (0-Cu-4dxy     = 0.388) (0-Cu-4dx2-y2  = 0.287) (0-Cu-5dxy     = 0.124) 
+   [ 27] occ = 0.00000 | (0-Cu-4f-1     = 0.281) (0-Cu-4f 1     = 0.172) (0-Cu-5f-1     = 0.140) 
+   [ 28] occ = 0.00000 | (0-Cu-4f 1     = 0.213) (0-Cu-4f-2     = 0.194) (0-Cu-4f 0     = 0.135) 
+   [ 29] occ = 0.00000 | (0-Cu-4f 2     = 0.297) (0-Cu-5f 2     = 0.147) (0-Cu-4f-3     = 0.114) 
+   [ 30] occ = 0.00000 | (0-Cu-4f 0     = 0.167) (0-Cu-4f 3     = 0.165) (0-Cu-4f 1     = 0.122) 
+   [ 31] occ = 0.00000 | (0-Cu-4f 2     = 0.171) (0-Cu-4f 0     = 0.171) (0-Cu-4f-2     = 0.170) 
+   [ 32] occ = 0.00000 | (0-Cu-4f-3     = 0.358) (0-Cu-4f 3     = 0.254) (0-Cu-5f-3     = 0.178) 
+   [ 33] occ = 0.00000 | (0-Cu-4f-2     = 0.186) (0-Cu-4f-1     = 0.127) (0-Cu-4f 0     = 0.105) 
+   [ 34] occ = 0.00000 | (0-Cu-6s       = 0.985) (0-Cu-5s       = 0.015) (0-Cu-4s       = 0.000) 
+   [ 35] occ = 0.00000 | (0-Cu-5dx2-y2  = 0.417) (0-Cu-5dxz     = 0.241) (0-Cu-4dx2-y2  = 0.133) 
+   [ 36] occ = 0.00000 | (0-Cu-5dz^2    = 0.675) (0-Cu-4dz^2    = 0.216) (0-Cu-5dx2-y2  = 0.042) 
+   [ 37] occ = 0.00000 | (0-Cu-5dxz     = 0.357) (0-Cu-5dyz     = 0.258) (0-Cu-4dxz     = 0.114) 
+   [ 38] occ = 0.00000 | (0-Cu-5dxy     = 0.719) (0-Cu-4dxy     = 0.230) (0-Cu-5dxz     = 0.027) 
+   [ 39] occ = 0.00000 | (0-Cu-5dyz     = 0.450) (0-Cu-5dx2-y2  = 0.191) (0-Cu-4dyz     = 0.144) 
+   [ 40] occ = 0.00000 | (0-Cu-6py      = 0.462) (0-Cu-5py      = 0.460) (0-Cu-6pz      = 0.031) 
+   [ 41] occ = 0.00000 | (0-Cu-6px      = 0.268) (0-Cu-5px      = 0.267) (0-Cu-6pz      = 0.224) 
+   [ 42] occ = 0.00000 | (0-Cu-6pz      = 0.242) (0-Cu-5pz      = 0.241) (0-Cu-6px      = 0.224) 
+   [ 43] occ = 0.00000 | (0-Cu-5f-3     = 0.197) (0-Cu-5f-2     = 0.183) (0-Cu-5f 0     = 0.139) 
+   [ 44] occ = 0.00000 | (0-Cu-5f 2     = 0.475) (0-Cu-4f 2     = 0.236) (0-Cu-5f 1     = 0.063) 
+   [ 45] occ = 0.00000 | (0-Cu-5f-3     = 0.362) (0-Cu-4f-3     = 0.180) (0-Cu-5f 0     = 0.120) 
+   [ 46] occ = 0.00000 | (0-Cu-5f 1     = 0.500) (0-Cu-4f 1     = 0.249) (0-Cu-5f-3     = 0.080) 
+   [ 47] occ = 0.00000 | (0-Cu-5f-2     = 0.308) (0-Cu-5f 3     = 0.204) (0-Cu-4f-2     = 0.153) 
+   [ 48] occ = 0.00000 | (0-Cu-5f 0     = 0.372) (0-Cu-5f 3     = 0.228) (0-Cu-4f 0     = 0.185) 
+   [ 49] occ = 0.00000 | (0-Cu-5f-1     = 0.520) (0-Cu-4f-1     = 0.258) (0-Cu-5f 1     = 0.051) 
+cas list =  [9, 10, 11, 12, 13, 14, 22, 23, 24, 25, 26]
+split localization at 0.1 ~ 1.9
+active occ =  11.0 [2. 2. 2. 2. 2. 1. 0. 0. 0. 0. 0.]
+low orbs =  [ 6  7  8  9 10]
+
+[pm_loc_kernel]
+ mocoeff.shape= (50, 5)
+ tol= 1e-06
+ maxcycle= 1000
+ partition= 1 \n [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]]
+ initial funval =  4.999999999999997
+icycle= 0 delta= 0.0 fun= 4.999999999999997
+CONG: PMloc converged!
+mid orbs =  [5]
+
+[pm_loc_kernel]
+ mocoeff.shape= (50, 1)
+ tol= 1e-06
+ maxcycle= 1000
+ partition= 1 \n [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]]
+ initial funval =  1.0000000000000013
+icycle= 0 delta= 0.0 fun= 1.0000000000000013
+CONG: PMloc converged!
+high orbs =  [0 1 2 3 4]
+
+[pm_loc_kernel]
+ mocoeff.shape= (50, 5)
+ tol= 1e-06
+ maxcycle= 1000
+ partition= 1 \n [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]]
+ initial funval =  5.000000000000003
+icycle= 0 delta= 0.0 fun= 5.000000000000003
+CONG: PMloc converged!
+NACTORB = 11 NACTELEC = 11 NCORE = 9
+
+******** <class 'pyscf.mcscf.addons._state_average_mcscf_solver.<locals>.StateAverageMCSCF'> ********
+CAS (6e+5e, 11o), ncore = 9, nvir = 30
+max_cycle_macro = 50
+max_cycle_micro = 4
+conv_tol = 1e-07
+conv_tol_grad = None
+orbital rotation max_stepsize = 0.02
+orbital rotation threshold for CI restart = 0.01
+augmented hessian ah_max_cycle = 30
+augmented hessian ah_conv_tol = 1e-12
+augmented hessian ah_linear dependence = 1e-14
+augmented hessian ah_level shift = 1e-08
+augmented hessian ah_start_tol = 2.5
+augmented hessian ah_start_cycle = 3
+augmented hessian ah_grad_trust_region = 3
+kf_trust_region = 3
+kf_interval = 4
+ci_response_space = 4
+ci_grad_trust_region = 3
+with_dep4 0
+natorb = False
+canonicalization = True
+sorting_mo_energy = False
+ao2mo_level = 2
+chkfile = /central/scratch/hczhai/soc-pyscf-tmp/tmp1o359ybg
+max_memory 100000 MB (current use 158 MB)
+internal_rotation = False
+******** <class 'pyscf.mcscf.addons.state_average.<locals>.FakeCISolver'> ********
+max. cycles = 50
+conv_tol = 1e-08
+davidson only = False
+linear dependence = 1e-10
+level shift = 0.001
+max iter space = 12
+max_memory 100000 MB
+nroots = 6
+pspace_size = 400
+spin = None
+State-average over 6 states with weights (0.5, 0.1, 0.1, 0.1, 0.1, 0.1)
+CASCI E = -1653.21476425648  S^2 = 0.7500000
+Set conv_tol_grad to 0.000316228
+macro iter 1 (21 JK  4 micro), CASSCF E = -1653.31233243775  dE = -0.097568181  S^2 = 0.7500000
+               |grad[o]|=0.372  |ddm|=0.0144  |maxRot[o]|=0.314
+macro iter 2 (18 JK  4 micro), CASSCF E = -1653.34116304556  dE = -0.028830608  S^2 = 0.7500000
+               |grad[o]|=0.185  |ddm|=0.0231  |maxRot[o]|=0.257
+macro iter 3 (9 JK  4 micro), CASSCF E = -1653.34149546406  dE = -0.0003324185  S^2 = 0.7500000
+               |grad[o]|=0.0246  |ddm|=0.00438  |maxRot[o]|=0.0306
+macro iter 4 (3 JK  1 micro), CASSCF E = -1653.34149549637  dE = -3.2305707e-08  S^2 = 0.7500000
+               |grad[o]|=0.000421  |ddm|=5.16e-05  |maxRot[o]|=0.000163
+macro iter 5 (3 JK  1 micro), CASSCF E = -1653.34149549948  dE = -3.114792e-09  S^2 = 0.7500000
+               |grad[o]|=0.000126  |ddm|=2.28e-05  |maxRot[o]|=3.52e-05
+1-step CASSCF converged in 5 macro (54 JK 14 micro) steps
+CASSCF canonicalization
+Density matrix diagonal elements [1.88539678 1.88539675 1.88539679 1.88539686 1.8853968  1.49974946
+ 0.01465335 0.01465332 0.01465331 0.01465334 0.01465325]
+CASSCF energy = -1653.34149549948
+CASCI E = -1653.34149549948  E(CI) = -50.4005087815981  S^2 = 0.7500000
+CASCI state-averaged energy = -1653.34149549948
+CASCI energy for each state
+  State 0 weight 0.5  E = -1653.37222008194 S^2 = 0.7500000
+  State 1 weight 0.1  E = -1653.310770948 S^2 = 0.7500000
+  State 2 weight 0.1  E = -1653.31077092926 S^2 = 0.7500000
+  State 3 weight 0.1  E = -1653.31077091443 S^2 = 0.7500000
+  State 4 weight 0.1  E = -1653.31077089913 S^2 = 0.7500000
+  State 5 weight 0.1  E = -1653.31077089428 S^2 = 0.7500000
+ncore =  9  ncas =  11
+reordering =  [ 5  8  9  6  7 10  1  4  0  2  3]
+MF FINISH TIME =  10/03/2022 12:32:58
+MF TIME  =               23.268
+rank =     0 mpo terms =       8842
+Build MPO | Nsites =    11 | Nterms =       8842 | Algorithm = FastBIP | Cutoff = 1.00e-14
+ Site =     0 /    11 .. Mmpo =    15 Error = 0.00e+00 Tmvc = 0.001 T = 0.002
+ Site =     1 /    11 .. Mmpo =    44 Error = 0.00e+00 Tmvc = 0.001 T = 0.003
+ Site =     2 /    11 .. Mmpo =    66 Error = 0.00e+00 Tmvc = 0.001 T = 0.003
+ Site =     3 /    11 .. Mmpo =    96 Error = 0.00e+00 Tmvc = 0.001 T = 0.004
+ Site =     4 /    11 .. Mmpo =   134 Error = 0.00e+00 Tmvc = 0.001 T = 0.004
+ Site =     5 /    11 .. Mmpo =   134 Error = 0.00e+00 Tmvc = 0.001 T = 0.006
+ Site =     6 /    11 .. Mmpo =    96 Error = 0.00e+00 Tmvc = 0.000 T = 0.002
+ Site =     7 /    11 .. Mmpo =    66 Error = 0.00e+00 Tmvc = 0.000 T = 0.002
+ Site =     8 /    11 .. Mmpo =    44 Error = 0.00e+00 Tmvc = 0.000 T = 0.001
+ Site =     9 /    11 .. Mmpo =    15 Error = 0.00e+00 Tmvc = 0.000 T = 0.001
+ Site =    10 /    11 .. Mmpo =     1 Error = 0.00e+00 Tmvc = 0.000 T = 0.000
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Sweep =    0 | Direction =  forward | Bond dimension =  500 | Noise =  1.00e-04 | Dav threshold =  1.00e-05
+ --> Site =    0-   1 .. Mmps =    3 Ndav =  59 Error = 0.00e+00 FLOPS = 8.25e+06 Tdav = 1.55
+          .. E[  0] =  -1645.59707336  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1645.48669232  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1645.23046416  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1645.16134391  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1645.15994636  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1645.06505139  < N=11 S=1/2 PG=0 > (1.000000) T = 1.64
+ --> Site =    1-   2 .. Mmps =   10 Ndav =  48 Error = 0.00e+00 FLOPS = 8.21e+09 Tdav = 0.03
+          .. E[  0] =  -1647.31312751  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1647.05071489  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1646.97573879  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1646.93670710  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1646.87673289  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1646.83377717  < N=11 S=1/2 PG=0 > (1.000000) T = 0.04
+ --> Site =    2-   3 .. Mmps =   35 Ndav =  45 Error = 0.00e+00 FLOPS = 2.76e+10 Tdav = 0.05
+          .. E[  0] =  -1649.63616295  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1649.01152752  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1648.91379805  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1648.84082525  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1648.72727810  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1648.55813316  < N=11 S=1/2 PG=0 > (1.000000) T = 0.07
+ --> Site =    3-   4 .. Mmps =  126 Ndav =  47 Error = 0.00e+00 FLOPS = 5.85e+10 Tdav = 0.18
+          .. E[  0] =  -1651.49375460  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1651.13631984  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1650.96879170  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1650.90753723  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1650.69644135  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1650.65804568  < N=11 S=1/2 PG=0 > (1.000000) T = 0.20
+ --> Site =    4-   5 .. Mmps =  462 Ndav =  58 Error = 0.00e+00 FLOPS = 1.23e+11 Tdav = 0.73
+          .. E[  0] =  -1653.30230901  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.24177570  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.23042362  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.21665915  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1651.45234200  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1651.40029220  < N=11 S=1/2 PG=0 > (1.000000) T = 0.79
+ --> Site =    5-   6 .. Mmps =  510 Ndav =  42 Error = 1.59e-05 FLOPS = 6.07e+10 Tdav = 2.97
+          .. E[  0] =  -1653.37222000  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077082  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077075  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077075  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077066  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077031  < N=11 S=1/2 PG=0 > (1.000000) T = 3.40
+ --> Site =    6-   7 .. Mmps =  503 Ndav =  12 Error = 3.42e-06 FLOPS = 3.37e+10 Tdav = 0.38
+          .. E[  0] =  -1653.37158577  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31069146  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31069083  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31069050  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31069015  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31068957  < N=11 S=1/2 PG=0 > (1.000000) T = 0.72
+ --> Site =    7-   8 .. Mmps =  500 Ndav =   6 Error = 4.34e-09 FLOPS = 6.56e+10 Tdav = 0.02
+          .. E[  0] =  -1653.37158507  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067179  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066469  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066273  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066222  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066047  < N=11 S=1/2 PG=0 > (1.000000) T = 0.15
+ --> Site =    8-   9 .. Mmps =  500 Ndav =   6 Error = 4.40e-21 FLOPS = 2.86e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37158505  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067178  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066469  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066273  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066221  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066046  < N=11 S=1/2 PG=0 > (1.000000) T = 0.09
+ --> Site =    9-  10 .. Mmps =  432 Ndav =   6 Error = 3.71e-23 FLOPS = 8.44e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37158505  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067178  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066469  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066273  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066221  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066046  < N=11 S=1/2 PG=0 > (1.000000) T = 0.08
+Time elapsed =      7.173 | E[  6] =   -1653.3722199992  -1653.3107708192  -1653.3107707549  -1653.3107707539  -1653.3107706632  -1653.3107703121 | DW = 1.59e-05
+Time sweep =        7.173 | 276 GFLOP/SWP
+ | Tcomm = 0.001 | Tidle = 0.000 | Twait = 0.000 | Dmem = 38.6 MB (14%) | Imem = 141 KB (92%) | Hmem = 279 MB | Pmem = 5.90 MB
+ | Tread = 0.146 | Twrite = 0.269 | Tfpread = 0.135 | Tfpwrite = 0.260 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 103 MB | cpsd = 81.1 MB
+ | Trot = 0.041 | Tctr = 0.007 | Tint = 0.016 | Tmid = 0.000 | Tdctr = 0.115 | Tdiag = 0.129 | Tinfo = 0.008
+ | Teff = 0.466 | Tprt = 0.308 | Teig = 5.919 | Tblk = 6.828 | Tmve = 0.343 | Tdm = 0.026 | Tsplt = 0.053 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =    1 | Direction = backward | Bond dimension =  500 | Noise =  1.00e-04 | Dav threshold =  1.00e-05
+ <-- Site =    9-  10 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 8.44e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37158505  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067178  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066469  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066273  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066221  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066046  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ <-- Site =    8-   9 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 2.79e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37158505  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067178  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066469  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066273  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066221  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066046  < N=11 S=1/2 PG=0 > (1.000000) T = 0.04
+ <-- Site =    7-   8 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 7.09e+10 Tdav = 0.02
+          .. E[  0] =  -1653.37158505  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067178  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066469  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066273  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066221  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066046  < N=11 S=1/2 PG=0 > (1.000000) T = 0.05
+ <-- Site =    6-   7 .. Mmps =  126 Ndav =  16 Error = 0.00e+00 FLOPS = 1.53e+11 Tdav = 0.11
+          .. E[  0] =  -1653.37158662  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31069139  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31069061  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31069054  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31069018  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31068965  < N=11 S=1/2 PG=0 > (1.000000) T = 0.17
+ <-- Site =    5-   6 .. Mmps =  462 Ndav =  19 Error = 0.00e+00 FLOPS = 2.17e+11 Tdav = 0.38
+          .. E[  0] =  -1653.37221999  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077066  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077065  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077060  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077055  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077042  < N=11 S=1/2 PG=0 > (1.000000) T = 0.51
+ <-- Site =    4-   5 .. Mmps =  507 Ndav =   6 Error = 5.48e-06 FLOPS = 2.23e+11 Tdav = 0.12
+          .. E[  0] =  -1653.37221999  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077066  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077065  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077060  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077055  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077042  < N=11 S=1/2 PG=0 > (1.000000) T = 0.32
+ <-- Site =    3-   4 .. Mmps =  501 Ndav =   6 Error = 4.49e-07 FLOPS = 1.31e+11 Tdav = 0.04
+          .. E[  0] =  -1653.37218071  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073921  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31072210  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31072085  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31072060  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071903  < N=11 S=1/2 PG=0 > (1.000000) T = 0.18
+ <-- Site =    2-   3 .. Mmps =  500 Ndav =   6 Error = 2.09e-10 FLOPS = 5.85e+10 Tdav = 0.02
+          .. E[  0] =  -1653.37217846  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073684  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071945  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071800  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071640  < N=11 S=1/2 PG=0 > (1.000000) T = 0.14
+ <-- Site =    1-   2 .. Mmps =  500 Ndav =   6 Error = 1.18e-21 FLOPS = 2.87e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37217846  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073684  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071945  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071800  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071640  < N=11 S=1/2 PG=0 > (1.000000) T = 0.10
+ <-- Site =    0-   1 .. Mmps =  386 Ndav =   6 Error = 4.74e-23 FLOPS = 8.14e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37217846  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073684  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071945  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071800  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071640  < N=11 S=1/2 PG=0 > (1.000000) T = 0.10
+Time elapsed =      8.793 | E[  6] =   -1653.3722199947  -1653.3107706558  -1653.3107706469  -1653.3107706018  -1653.3107705538  -1653.3107704213 | DE = -1.09e-07 | DW = 5.48e-06
+Time sweep =        1.620 | 123 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 38.6 MB (14%) | Imem = 99.0 KB (95%) | Hmem = 281 MB | Pmem = 5.90 MB
+ | Tread = 0.054 | Twrite = 0.253 | Tfpread = 0.049 | Tfpwrite = 0.249 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 93.1 MB | cpsd = 73.1 MB
+ | Trot = 0.032 | Tctr = 0.001 | Tint = 0.001 | Tmid = 0.000 | Tdctr = 0.001 | Tdiag = 0.011 | Tinfo = 0.006
+ | Teff = 0.254 | Tprt = 0.251 | Teig = 0.696 | Tblk = 1.325 | Tmve = 0.294 | Tdm = 0.027 | Tsplt = 0.048 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =    2 | Direction =  forward | Bond dimension =  500 | Noise =  1.00e-04 | Dav threshold =  1.00e-05
+ --> Site =    0-   1 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 8.60e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37217846  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073684  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071945  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071800  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071640  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ --> Site =    1-   2 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 2.99e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37217846  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073684  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071945  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071800  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071640  < N=11 S=1/2 PG=0 > (1.000000) T = 0.03
+ --> Site =    2-   3 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 6.41e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37217846  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073684  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071945  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071800  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071640  < N=11 S=1/2 PG=0 > (1.000000) T = 0.04
+ --> Site =    3-   4 .. Mmps =  126 Ndav =  12 Error = 0.00e+00 FLOPS = 1.25e+11 Tdav = 0.08
+          .. E[  0] =  -1653.37218179  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073990  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31072347  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31072229  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31072136  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31072053  < N=11 S=1/2 PG=0 > (1.000000) T = 0.13
+ --> Site =    4-   5 .. Mmps =  462 Ndav =  18 Error = 0.00e+00 FLOPS = 2.12e+11 Tdav = 0.36
+          .. E[  0] =  -1653.37221997  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077076  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077074  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077067  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077065  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077054  < N=11 S=1/2 PG=0 > (1.000000) T = 0.47
+ --> Site =    5-   6 .. Mmps =  510 Ndav =   6 Error = 1.59e-05 FLOPS = 5.22e+10 Tdav = 0.49
+          .. E[  0] =  -1653.37221997  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077076  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077074  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077067  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077065  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077054  < N=11 S=1/2 PG=0 > (1.000000) T = 0.93
+ --> Site =    6-   7 .. Mmps =  503 Ndav =  12 Error = 3.49e-06 FLOPS = 1.55e+10 Tdav = 0.83
+          .. E[  0] =  -1653.37158590  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31069109  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31069101  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31069061  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31069000  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31068947  < N=11 S=1/2 PG=0 > (1.000000) T = 1.30
+ --> Site =    7-   8 .. Mmps =  500 Ndav =   6 Error = 4.31e-09 FLOPS = 1.86e+10 Tdav = 0.06
+          .. E[  0] =  -1653.37158520  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31066825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066441  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066388  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066269  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066104  < N=11 S=1/2 PG=0 > (1.000000) T = 0.34
+ --> Site =    8-   9 .. Mmps =  500 Ndav =   6 Error = 3.64e-21 FLOPS = 5.81e+08 Tdav = 0.38
+          .. E[  0] =  -1653.37158519  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31066825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066441  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066387  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066269  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066104  < N=11 S=1/2 PG=0 > (1.000000) T = 0.74
+ --> Site =    9-  10 .. Mmps =  467 Ndav =   6 Error = 2.77e-23 FLOPS = 4.74e+07 Tdav = 0.39
+          .. E[  0] =  -1653.37158519  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31066825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066441  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066387  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066269  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066104  < N=11 S=1/2 PG=0 > (1.000000) T = 0.74
+Time elapsed =     13.534 | E[  6] =   -1653.3722199675  -1653.3107707613  -1653.3107707401  -1653.3107706722  -1653.3107706467  -1653.3107705439 | DE = -1.23e-07 | DW = 1.59e-05
+Time sweep =        4.741 | 120 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 38.6 MB (14%) | Imem = 99.0 KB (95%) | Hmem = 281 MB | Pmem = 5.90 MB
+ | Tread = 0.232 | Twrite = 0.354 | Tfpread = 0.231 | Tfpwrite = 0.344 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 104 MB | cpsd = 80.6 MB
+ | Trot = 0.056 | Tctr = 0.016 | Tint = 0.031 | Tmid = 0.000 | Tdctr = 0.167 | Tdiag = 0.209 | Tinfo = 0.008
+ | Teff = 0.748 | Tprt = 0.748 | Teig = 2.634 | Tblk = 4.272 | Tmve = 0.467 | Tdm = 0.028 | Tsplt = 0.061 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =    3 | Direction = backward | Bond dimension =  500 | Noise =  1.00e-04 | Dav threshold =  1.00e-05
+ <-- Site =    9-  10 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 5.42e+07 Tdav = 0.34
+          .. E[  0] =  -1653.37158519  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31066825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066441  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066387  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066269  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066104  < N=11 S=1/2 PG=0 > (1.000000) T = 0.40
+ <-- Site =    8-   9 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 2.48e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37158519  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31066825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066441  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066387  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066269  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066104  < N=11 S=1/2 PG=0 > (1.000000) T = 0.04
+ <-- Site =    7-   8 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 4.77e+10 Tdav = 0.02
+          .. E[  0] =  -1653.37158519  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31066825  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066441  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066387  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066269  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066104  < N=11 S=1/2 PG=0 > (1.000000) T = 0.06
+ <-- Site =    6-   7 .. Mmps =  126 Ndav =  16 Error = 0.00e+00 FLOPS = 1.35e+11 Tdav = 0.13
+          .. E[  0] =  -1653.37158673  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31069108  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31069097  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31069045  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31068973  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31068956  < N=11 S=1/2 PG=0 > (1.000000) T = 0.20
+ <-- Site =    5-   6 .. Mmps =  462 Ndav =  19 Error = 0.00e+00 FLOPS = 2.16e+11 Tdav = 0.38
+          .. E[  0] =  -1653.37222000  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077064  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077057  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077050  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077040  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077034  < N=11 S=1/2 PG=0 > (1.000000) T = 0.50
+ <-- Site =    4-   5 .. Mmps =  506 Ndav =   6 Error = 5.46e-06 FLOPS = 2.07e+11 Tdav = 0.12
+          .. E[  0] =  -1653.37222000  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077064  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077057  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077050  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077040  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077034  < N=11 S=1/2 PG=0 > (1.000000) T = 0.35
+ <-- Site =    3-   4 .. Mmps =  501 Ndav =   6 Error = 4.13e-07 FLOPS = 1.19e+11 Tdav = 0.04
+          .. E[  0] =  -1653.37218065  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073759  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31072159  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31072045  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071983  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071911  < N=11 S=1/2 PG=0 > (1.000000) T = 0.18
+ <-- Site =    2-   3 .. Mmps =  500 Ndav =   6 Error = 2.12e-10 FLOPS = 2.27e+09 Tdav = 0.40
+          .. E[  0] =  -1653.37217840  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073517  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071898  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071804  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071715  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071629  < N=11 S=1/2 PG=0 > (1.000000) T = 0.62
+ <-- Site =    1-   2 .. Mmps =  500 Ndav =   6 Error = 9.18e-22 FLOPS = 1.79e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37217840  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073517  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071898  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071804  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071715  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071629  < N=11 S=1/2 PG=0 > (1.000000) T = 0.10
+ <-- Site =    0-   1 .. Mmps =  403 Ndav =   6 Error = 4.57e-23 FLOPS = 7.75e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37217840  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073517  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071898  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071804  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071715  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071629  < N=11 S=1/2 PG=0 > (1.000000) T = 0.11
+Time elapsed =     16.100 | E[  6] =   -1653.3722199966  -1653.3107706416  -1653.3107705697  -1653.3107704979  -1653.3107704030  -1653.3107703409 | DE = 2.03e-07 | DW = 5.46e-06
+Time sweep =        2.566 | 123 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 38.6 MB (14%) | Imem = 99.0 KB (95%) | Hmem = 281 MB | Pmem = 5.90 MB
+ | Tread = 0.075 | Twrite = 0.262 | Tfpread = 0.064 | Tfpwrite = 0.252 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 92.7 MB | cpsd = 72.8 MB
+ | Trot = 0.038 | Tctr = 0.001 | Tint = 0.001 | Tmid = 0.000 | Tdctr = 0.018 | Tdiag = 0.086 | Tinfo = 0.007
+ | Teff = 0.398 | Tprt = 0.263 | Teig = 1.463 | Tblk = 2.254 | Tmve = 0.311 | Tdm = 0.030 | Tsplt = 0.049 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =    4 | Direction =  forward | Bond dimension =  500 | Noise =  1.00e-04 | Dav threshold =  1.00e-05
+ --> Site =    0-   1 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 6.64e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37217840  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073517  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071898  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071804  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071715  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071629  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ --> Site =    1-   2 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 2.55e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37217840  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073517  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071898  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071804  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071715  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071629  < N=11 S=1/2 PG=0 > (1.000000) T = 0.04
+ --> Site =    2-   3 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 6.22e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37217840  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073517  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31071898  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31071804  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31071715  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31071629  < N=11 S=1/2 PG=0 > (1.000000) T = 0.05
+ --> Site =    3-   4 .. Mmps =  126 Ndav =  12 Error = 0.00e+00 FLOPS = 1.16e+11 Tdav = 0.09
+          .. E[  0] =  -1653.37218162  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31073828  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31072281  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31072140  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31072098  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31072054  < N=11 S=1/2 PG=0 > (1.000000) T = 0.14
+ --> Site =    4-   5 .. Mmps =  462 Ndav =  18 Error = 0.00e+00 FLOPS = 1.93e+11 Tdav = 0.40
+          .. E[  0] =  -1653.37221998  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077072  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077063  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077057  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077049  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077048  < N=11 S=1/2 PG=0 > (1.000000) T = 0.52
+ --> Site =    5-   6 .. Mmps =  510 Ndav =   6 Error = 1.59e-05 FLOPS = 2.03e+11 Tdav = 0.13
+          .. E[  0] =  -1653.37221998  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077072  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077063  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077057  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077049  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077048  < N=11 S=1/2 PG=0 > (1.000000) T = 0.39
+ --> Site =    6-   7 .. Mmps =  503 Ndav =  12 Error = 3.18e-06 FLOPS = 1.27e+11 Tdav = 0.10
+          .. E[  0] =  -1653.37158591  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31069120  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31069092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31069035  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31069006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31068934  < N=11 S=1/2 PG=0 > (1.000000) T = 0.31
+ --> Site =    7-   8 .. Mmps =  500 Ndav =   6 Error = 4.60e-09 FLOPS = 4.53e+09 Tdav = 0.26
+          .. E[  0] =  -1653.37158521  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067167  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066500  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066417  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066348  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066233  < N=11 S=1/2 PG=0 > (1.000000) T = 0.48
+ --> Site =    8-   9 .. Mmps =  500 Ndav =   6 Error = 4.13e-21 FLOPS = 1.71e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37158520  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067167  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066500  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066417  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066348  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066233  < N=11 S=1/2 PG=0 > (1.000000) T = 0.12
+ --> Site =    9-  10 .. Mmps =  493 Ndav =   6 Error = 2.08e-23 FLOPS = 7.40e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37158520  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067167  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066500  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066417  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066348  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066233  < N=11 S=1/2 PG=0 > (1.000000) T = 0.10
+Time elapsed =     18.254 | E[  6] =   -1653.3722199796  -1653.3107707188  -1653.3107706331  -1653.3107705739  -1653.3107704908  -1653.3107704807 | DE = -1.40e-07 | DW = 1.59e-05
+Time sweep =        2.155 | 120 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 38.6 MB (14%) | Imem = 99.0 KB (95%) | Hmem = 281 MB | Pmem = 5.90 MB
+ | Tread = 0.145 | Twrite = 0.281 | Tfpread = 0.136 | Tfpwrite = 0.277 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 104 MB | cpsd = 80.6 MB
+ | Trot = 0.043 | Tctr = 0.003 | Tint = 0.001 | Tmid = 0.000 | Tdctr = 0.091 | Tdiag = 0.050 | Tinfo = 0.008
+ | Teff = 0.449 | Tprt = 0.222 | Teig = 1.019 | Tblk = 1.815 | Tmve = 0.338 | Tdm = 0.028 | Tsplt = 0.055 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =    5 | Direction = backward | Bond dimension = 1000 | Noise =  1.00e-05 | Dav threshold =  1.00e-05
+ <-- Site =    9-  10 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 8.02e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37158520  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067167  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066500  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066417  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066348  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066233  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ <-- Site =    8-   9 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 2.00e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37158520  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067167  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066500  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066417  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066348  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066233  < N=11 S=1/2 PG=0 > (1.000000) T = 0.05
+ <-- Site =    7-   8 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 5.68e+10 Tdav = 0.02
+          .. E[  0] =  -1653.37158520  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31067167  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31066500  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31066417  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31066348  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31066233  < N=11 S=1/2 PG=0 > (1.000000) T = 0.06
+ <-- Site =    6-   7 .. Mmps =  126 Ndav =  18 Error = 0.00e+00 FLOPS = 1.15e+11 Tdav = 0.15
+          .. E[  0] =  -1653.37158672  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31069092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31069071  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31069048  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31068990  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31068951  < N=11 S=1/2 PG=0 > (1.000000) T = 0.22
+ <-- Site =    5-   6 .. Mmps =  462 Ndav =  19 Error = 0.00e+00 FLOPS = 1.95e+11 Tdav = 0.42
+          .. E[  0] =  -1653.37222000  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077062  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077059  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077043  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077038  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077023  < N=11 S=1/2 PG=0 > (1.000000) T = 0.56
+ <-- Site =    4-   5 .. Mmps = 1002 Ndav =   6 Error = 9.95e-08 FLOPS = 2.06e+11 Tdav = 0.12
+          .. E[  0] =  -1653.37222000  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077062  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077059  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077043  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077038  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077023  < N=11 S=1/2 PG=0 > (1.000000) T = 0.36
+ <-- Site =    3-   4 .. Mmps = 1000 Ndav =   6 Error = 1.23e-08 FLOPS = 1.14e+11 Tdav = 0.17
+          .. E[  0] =  -1653.37221932  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076945  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076941  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076927  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076916  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076903  < N=11 S=1/2 PG=0 > (1.000000) T = 0.66
+ <-- Site =    2-   3 .. Mmps = 1000 Ndav =   6 Error = 2.13e-20 FLOPS = 4.12e+10 Tdav = 0.09
+          .. E[  0] =  -1653.37221922  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076937  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076934  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076919  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076907  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076894  < N=11 S=1/2 PG=0 > (1.000000) T = 0.48
+ <-- Site =    1-   2 .. Mmps =  829 Ndav =   6 Error = 1.28e-22 FLOPS = 2.21e+10 Tdav = 0.04
+          .. E[  0] =  -1653.37221922  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076937  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076934  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076919  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076907  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076894  < N=11 S=1/2 PG=0 > (1.000000) T = 0.32
+ <-- Site =    0-   1 .. Mmps =  520 Ndav =   6 Error = 8.28e-23 FLOPS = 1.31e+09 Tdav = 0.04
+          .. E[  0] =  -1653.37221922  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076937  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076934  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076919  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076907  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076894  < N=11 S=1/2 PG=0 > (1.000000) T = 0.33
+Time elapsed =     21.310 | E[  6] =   -1653.3722199966  -1653.3107706230  -1653.3107705888  -1653.3107704258  -1653.3107703815  -1653.3107702296 | DE = 2.51e-07 | DW = 9.95e-08
+Time sweep =        3.056 | 139 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 100 MB (5%) | Imem = 99.0 KB (95%) | Hmem = 875 MB | Pmem = 5.90 MB
+ | Tread = 0.054 | Twrite = 0.452 | Tfpread = 0.043 | Tfpwrite = 0.447 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 287 MB | cpsd = 222 MB
+ | Trot = 0.130 | Tctr = 0.001 | Tint = 0.001 | Tmid = 0.000 | Tdctr = 0.001 | Tdiag = 0.058 | Tinfo = 0.007
+ | Teff = 0.585 | Tprt = 0.521 | Teig = 1.070 | Tblk = 2.462 | Tmve = 0.592 | Tdm = 0.055 | Tsplt = 0.185 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =    6 | Direction =  forward | Bond dimension = 1000 | Noise =  1.00e-05 | Dav threshold =  1.00e-05
+ --> Site =    0-   1 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 9.99e+09 Tdav = 0.01
+          .. E[  0] =  -1653.37221922  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076937  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076934  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076919  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076907  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076894  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ --> Site =    1-   2 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 2.22e+10 Tdav = 0.04
+          .. E[  0] =  -1653.37221922  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076937  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076934  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076919  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076907  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076894  < N=11 S=1/2 PG=0 > (1.000000) T = 0.15
+ --> Site =    2-   3 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 4.76e+10 Tdav = 0.08
+          .. E[  0] =  -1653.37221922  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076937  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076934  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076919  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076907  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076894  < N=11 S=1/2 PG=0 > (1.000000) T = 0.21
+ --> Site =    3-   4 .. Mmps =  126 Ndav =   6 Error = 0.00e+00 FLOPS = 1.17e+11 Tdav = 0.16
+          .. E[  0] =  -1653.37221922  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076937  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076934  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076919  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076907  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076894  < N=11 S=1/2 PG=0 > (1.000000) T = 0.35
+ --> Site =    4-   5 .. Mmps =  462 Ndav =  12 Error = 0.00e+00 FLOPS = 2.04e+11 Tdav = 0.25
+          .. E[  0] =  -1653.37222004  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077080  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077077  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077059  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077058  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077051  < N=11 S=1/2 PG=0 > (1.000000) T = 0.36
+ --> Site =    5-   6 .. Mmps = 1004 Ndav =   6 Error = 7.99e-07 FLOPS = 1.36e+11 Tdav = 0.19
+          .. E[  0] =  -1653.37222004  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077080  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077077  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077059  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077058  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077051  < N=11 S=1/2 PG=0 > (1.000000) T = 0.53
+ --> Site =    6-   7 .. Mmps = 1000 Ndav =   7 Error = 5.33e-08 FLOPS = 1.32e+11 Tdav = 0.18
+          .. E[  0] =  -1653.37217463  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076772  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076765  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076747  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076741  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076734  < N=11 S=1/2 PG=0 > (1.000000) T = 0.68
+ --> Site =    7-   8 .. Mmps = 1000 Ndav =   6 Error = 7.58e-20 FLOPS = 5.41e+10 Tdav = 0.08
+          .. E[  0] =  -1653.37217463  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076757  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076713  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076689  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076676  < N=11 S=1/2 PG=0 > (1.000000) T = 0.51
+ --> Site =    8-   9 .. Mmps =  961 Ndav =   6 Error = 1.01e-22 FLOPS = 2.24e+10 Tdav = 0.03
+          .. E[  0] =  -1653.37217463  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076757  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076713  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076689  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076676  < N=11 S=1/2 PG=0 > (1.000000) T = 0.33
+ --> Site =    9-  10 .. Mmps =  830 Ndav =   6 Error = 5.09e-23 FLOPS = 1.14e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37217463  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076757  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076713  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076689  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076676  < N=11 S=1/2 PG=0 > (1.000000) T = 0.23
+Time elapsed =     24.680 | E[  6] =   -1653.3722200359  -1653.3107708007  -1653.3107707722  -1653.3107705929  -1653.3107705810  -1653.3107705135 | DE = -2.84e-07 | DW = 7.99e-07
+Time sweep =        3.369 | 120 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 107 MB (5%) | Imem = 99.0 KB (95%) | Hmem = 910 MB | Pmem = 5.90 MB
+ | Tread = 0.296 | Twrite = 0.394 | Tfpread = 0.286 | Tfpwrite = 0.389 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 300 MB | cpsd = 233 MB
+ | Trot = 0.127 | Tctr = 0.008 | Tint = 0.001 | Tmid = 0.000 | Tdctr = 0.156 | Tdiag = 0.050 | Tinfo = 0.009
+ | Teff = 1.046 | Tprt = 0.432 | Teig = 1.023 | Tblk = 2.827 | Tmve = 0.541 | Tdm = 0.056 | Tsplt = 0.209 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =    7 | Direction = backward | Bond dimension = 1000 | Noise =  1.00e-05 | Dav threshold =  1.00e-05
+ <-- Site =    9-  10 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 1.21e+10 Tdav = 0.00
+          .. E[  0] =  -1653.37217463  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076757  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076713  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076689  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076676  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ <-- Site =    8-   9 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 2.36e+10 Tdav = 0.03
+          .. E[  0] =  -1653.37217463  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076757  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076713  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076689  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076676  < N=11 S=1/2 PG=0 > (1.000000) T = 0.13
+ <-- Site =    7-   8 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 5.66e+10 Tdav = 0.07
+          .. E[  0] =  -1653.37217463  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076757  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076713  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076689  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076676  < N=11 S=1/2 PG=0 > (1.000000) T = 0.21
+ <-- Site =    6-   7 .. Mmps =  126 Ndav =   7 Error = 0.00e+00 FLOPS = 1.37e+11 Tdav = 0.17
+          .. E[  0] =  -1653.37217463  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076765  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076757  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076713  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076689  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076676  < N=11 S=1/2 PG=0 > (1.000000) T = 0.36
+ <-- Site =    5-   6 .. Mmps =  462 Ndav =  13 Error = 0.00e+00 FLOPS = 2.24e+11 Tdav = 0.25
+          .. E[  0] =  -1653.37221996  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077067  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077065  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077061  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077046  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077042  < N=11 S=1/2 PG=0 > (1.000000) T = 0.37
+ <-- Site =    4-   5 .. Mmps = 1002 Ndav =   6 Error = 9.44e-08 FLOPS = 2.23e+11 Tdav = 0.12
+          .. E[  0] =  -1653.37221996  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077067  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077065  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077061  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077046  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077042  < N=11 S=1/2 PG=0 > (1.000000) T = 0.36
+ <-- Site =    3-   4 .. Mmps = 1000 Ndav =   6 Error = 8.75e-09 FLOPS = 1.19e+11 Tdav = 0.16
+          .. E[  0] =  -1653.37221929  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076953  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076949  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076945  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076935  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076926  < N=11 S=1/2 PG=0 > (1.000000) T = 0.60
+ <-- Site =    2-   3 .. Mmps = 1000 Ndav =   6 Error = 2.08e-20 FLOPS = 4.58e+10 Tdav = 0.08
+          .. E[  0] =  -1653.37221923  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076948  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076943  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076939  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076929  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076920  < N=11 S=1/2 PG=0 > (1.000000) T = 0.46
+ <-- Site =    1-   2 .. Mmps =  780 Ndav =   6 Error = 1.30e-22 FLOPS = 2.11e+10 Tdav = 0.04
+          .. E[  0] =  -1653.37221923  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076948  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076943  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076939  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076929  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076920  < N=11 S=1/2 PG=0 > (1.000000) T = 0.33
+ <-- Site =    0-   1 .. Mmps =  553 Ndav =   6 Error = 7.01e-23 FLOPS = 9.09e+09 Tdav = 0.01
+          .. E[  0] =  -1653.37221923  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076948  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076943  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076939  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076929  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076920  < N=11 S=1/2 PG=0 > (1.000000) T = 0.22
+Time elapsed =     27.728 | E[  6] =   -1653.3722199639  -1653.3107706683  -1653.3107706526  -1653.3107706061  -1653.3107704551  -1653.3107704151 | DE = 9.84e-08 | DW = 9.44e-08
+Time sweep =        3.048 | 124 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 107 MB (5%) | Imem = 99.0 KB (95%) | Hmem = 910 MB | Pmem = 5.90 MB
+ | Tread = 0.131 | Twrite = 0.387 | Tfpread = 0.119 | Tfpwrite = 0.382 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 281 MB | cpsd = 217 MB
+ | Trot = 0.120 | Tctr = 0.001 | Tint = 0.001 | Tmid = 0.000 | Tdctr = 0.001 | Tdiag = 0.011 | Tinfo = 0.007
+ | Teff = 0.795 | Tprt = 0.499 | Teig = 0.938 | Tblk = 2.530 | Tmve = 0.517 | Tdm = 0.055 | Tsplt = 0.166 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =    8 | Direction =  forward | Bond dimension = 1000 | Noise =  1.00e-05 | Dav threshold =  1.00e-05
+ --> Site =    0-   1 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 6.50e+09 Tdav = 0.01
+          .. E[  0] =  -1653.37221923  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076948  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076943  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076939  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076929  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076920  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ --> Site =    1-   2 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 1.72e+10 Tdav = 0.05
+          .. E[  0] =  -1653.37221923  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076948  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076943  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076939  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076929  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076920  < N=11 S=1/2 PG=0 > (1.000000) T = 0.16
+ --> Site =    2-   3 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 2.03e+10 Tdav = 0.19
+          .. E[  0] =  -1653.37221923  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076948  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076943  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076939  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076929  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076920  < N=11 S=1/2 PG=0 > (1.000000) T = 0.44
+ --> Site =    3-   4 .. Mmps =  126 Ndav =   6 Error = 0.00e+00 FLOPS = 1.06e+11 Tdav = 0.18
+          .. E[  0] =  -1653.37221923  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076948  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076943  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076939  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076929  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076920  < N=11 S=1/2 PG=0 > (1.000000) T = 0.38
+ --> Site =    4-   5 .. Mmps =  462 Ndav =  12 Error = 0.00e+00 FLOPS = 7.53e+10 Tdav = 0.68
+          .. E[  0] =  -1653.37222000  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077079  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077076  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077069  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077061  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077059  < N=11 S=1/2 PG=0 > (1.000000) T = 0.95
+ --> Site =    5-   6 .. Mmps = 1004 Ndav =   6 Error = 7.79e-07 FLOPS = 1.30e+11 Tdav = 0.20
+          .. E[  0] =  -1653.37222000  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077079  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077076  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077069  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077061  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077059  < N=11 S=1/2 PG=0 > (1.000000) T = 0.58
+ --> Site =    6-   7 .. Mmps = 1000 Ndav =   7 Error = 4.99e-08 FLOPS = 1.22e+11 Tdav = 0.19
+          .. E[  0] =  -1653.37217467  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076771  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076766  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076755  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076747  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076739  < N=11 S=1/2 PG=0 > (1.000000) T = 0.81
+ --> Site =    7-   8 .. Mmps = 1000 Ndav =   6 Error = 7.39e-20 FLOPS = 8.97e+09 Tdav = 0.45
+          .. E[  0] =  -1653.37217467  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076759  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076709  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076697  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076674  < N=11 S=1/2 PG=0 > (1.000000) T = 1.15
+ --> Site =    8-   9 .. Mmps =  927 Ndav =   6 Error = 9.55e-23 FLOPS = 2.14e+10 Tdav = 0.04
+          .. E[  0] =  -1653.37217467  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076759  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076709  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076697  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076674  < N=11 S=1/2 PG=0 > (1.000000) T = 0.45
+ --> Site =    9-  10 .. Mmps =  761 Ndav =   6 Error = 5.62e-23 FLOPS = 1.17e+10 Tdav = 0.00
+          .. E[  0] =  -1653.37217467  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076759  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076709  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076697  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076674  < N=11 S=1/2 PG=0 > (1.000000) T = 0.23
+Time elapsed =     32.883 | E[  6] =   -1653.3722200002  -1653.3107707900  -1653.3107707634  -1653.3107706919  -1653.3107706119  -1653.3107705876 | DE = -1.73e-07 | DW = 7.79e-07
+Time sweep =        5.156 | 120 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 107 MB (5%) | Imem = 99.0 KB (95%) | Hmem = 910 MB | Pmem = 5.90 MB
+ | Tread = 0.468 | Twrite = 0.514 | Tfpread = 0.455 | Tfpwrite = 0.498 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 296 MB | cpsd = 230 MB
+ | Trot = 0.141 | Tctr = 0.015 | Tint = 0.021 | Tmid = 0.000 | Tdctr = 0.266 | Tdiag = 0.144 | Tinfo = 0.009
+ | Teff = 1.399 | Tprt = 0.730 | Teig = 1.999 | Tblk = 4.454 | Tmve = 0.701 | Tdm = 0.055 | Tsplt = 0.199 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =    9 | Direction = backward | Bond dimension = 1000 | Noise =  1.00e-05 | Dav threshold =  1.00e-05
+ <-- Site =    9-  10 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 5.54e+09 Tdav = 0.01
+          .. E[  0] =  -1653.37217467  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076759  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076709  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076697  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076674  < N=11 S=1/2 PG=0 > (1.000000) T = 0.02
+ <-- Site =    8-   9 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 1.76e+10 Tdav = 0.04
+          .. E[  0] =  -1653.37217467  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076759  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076709  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076697  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076674  < N=11 S=1/2 PG=0 > (1.000000) T = 0.16
+ <-- Site =    7-   8 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 4.46e+10 Tdav = 0.09
+          .. E[  0] =  -1653.37217467  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076759  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076709  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076697  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076688  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076674  < N=11 S=1/2 PG=0 > (1.000000) T = 0.24
+ <-- Site =    6-   7 .. Mmps =  126 Ndav =   9 Error = 0.00e+00 FLOPS = 1.33e+11 Tdav = 0.23
+          .. E[  0] =  -1653.37217467  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076783  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076763  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076759  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076746  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076697  < N=11 S=1/2 PG=0 > (1.000000) T = 0.43
+ <-- Site =    5-   6 .. Mmps =  462 Ndav =  13 Error = 0.00e+00 FLOPS = 2.25e+11 Tdav = 0.25
+          .. E[  0] =  -1653.37221996  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077074  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077068  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077060  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077058  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077049  < N=11 S=1/2 PG=0 > (1.000000) T = 0.42
+ <-- Site =    4-   5 .. Mmps = 1002 Ndav =   6 Error = 9.60e-08 FLOPS = 2.16e+11 Tdav = 0.12
+          .. E[  0] =  -1653.37221996  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077074  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077068  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077060  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077058  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077049  < N=11 S=1/2 PG=0 > (1.000000) T = 0.36
+ <-- Site =    3-   4 .. Mmps = 1000 Ndav =   6 Error = 1.06e-08 FLOPS = 4.37e+10 Tdav = 0.43
+          .. E[  0] =  -1653.37221928  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076966  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076951  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076944  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076943  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076934  < N=11 S=1/2 PG=0 > (1.000000) T = 1.03
+ <-- Site =    2-   3 .. Mmps = 1000 Ndav =   6 Error = 1.96e-20 FLOPS = 4.64e+10 Tdav = 0.08
+          .. E[  0] =  -1653.37221921  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076959  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076944  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076938  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076936  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076927  < N=11 S=1/2 PG=0 > (1.000000) T = 0.44
+ <-- Site =    1-   2 .. Mmps =  762 Ndav =   6 Error = 1.21e-22 FLOPS = 2.69e+09 Tdav = 0.33
+          .. E[  0] =  -1653.37221921  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076959  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076944  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076938  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076936  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076927  < N=11 S=1/2 PG=0 > (1.000000) T = 0.76
+ <-- Site =    0-   1 .. Mmps =  496 Ndav =   6 Error = 6.43e-23 FLOPS = 7.60e+09 Tdav = 0.01
+          .. E[  0] =  -1653.37221921  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076959  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076944  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076938  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076936  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076927  < N=11 S=1/2 PG=0 > (1.000000) T = 0.16
+Time elapsed =     36.892 | E[  6] =   -1653.3722199614  -1653.3107707369  -1653.3107706793  -1653.3107705999  -1653.3107705774  -1653.3107704905 | DE = 9.71e-08 | DW = 9.60e-08
+Time sweep =        4.008 | 131 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 107 MB (5%) | Imem = 99.0 KB (95%) | Hmem = 910 MB | Pmem = 5.90 MB
+ | Tread = 0.179 | Twrite = 0.427 | Tfpread = 0.172 | Tfpwrite = 0.422 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 279 MB | cpsd = 216 MB
+ | Trot = 0.134 | Tctr = 0.006 | Tint = 0.011 | Tmid = 0.000 | Tdctr = 0.028 | Tdiag = 0.108 | Tinfo = 0.007
+ | Teff = 1.026 | Tprt = 0.519 | Teig = 1.588 | Tblk = 3.420 | Tmve = 0.586 | Tdm = 0.055 | Tsplt = 0.166 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =   10 | Direction =  forward | Bond dimension = 1500 | Noise =  1.00e-06 | Dav threshold =  1.00e-07
+ --> Site =    0-   1 .. Mmps =    3 Ndav =  13 Error = 0.00e+00 FLOPS = 1.16e+10 Tdav = 0.01
+          .. E[  0] =  -1653.37221926  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076967  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076953  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076948  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076945  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076939  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ --> Site =    1-   2 .. Mmps =   10 Ndav =  12 Error = 0.00e+00 FLOPS = 1.98e+10 Tdav = 0.09
+          .. E[  0] =  -1653.37221928  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076971  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076957  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076954  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076949  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076945  < N=11 S=1/2 PG=0 > (1.000000) T = 0.21
+ --> Site =    2-   3 .. Mmps =   35 Ndav =  12 Error = 0.00e+00 FLOPS = 5.38e+10 Tdav = 0.14
+          .. E[  0] =  -1653.37221929  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076973  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076960  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076957  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076952  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076948  < N=11 S=1/2 PG=0 > (1.000000) T = 0.27
+ --> Site =    3-   4 .. Mmps =  126 Ndav =  13 Error = 0.00e+00 FLOPS = 9.49e+10 Tdav = 0.43
+          .. E[  0] =  -1653.37221939  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31076983  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31076973  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31076969  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31076964  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31076963  < N=11 S=1/2 PG=0 > (1.000000) T = 0.72
+ --> Site =    4-   5 .. Mmps =  462 Ndav =  18 Error = 0.00e+00 FLOPS = 1.93e+11 Tdav = 0.40
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077094  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.52
+ --> Site =    5-   6 .. Mmps = 1500 Ndav =   6 Error = 8.75e-10 FLOPS = 2.26e+11 Tdav = 0.11
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077094  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.34
+ --> Site =    6-   7 .. Mmps = 1500 Ndav =   6 Error = 1.31e-10 FLOPS = 7.94e+10 Tdav = 0.49
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 1.65
+ --> Site =    7-   8 .. Mmps = 1500 Ndav =   6 Error = 3.74e-21 FLOPS = 4.80e+10 Tdav = 0.18
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 1.04
+ --> Site =    8-   9 .. Mmps =  817 Ndav =   6 Error = 1.19e-22 FLOPS = 1.89e+10 Tdav = 0.10
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.94
+ --> Site =    9-  10 .. Mmps =  542 Ndav =   6 Error = 5.21e-23 FLOPS = 1.01e+10 Tdav = 0.00
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.19
+Time elapsed =     42.793 | E[  6] =   -1653.3722200808  -1653.3107709433  -1653.3107709245  -1653.3107709089  -1653.3107708943  -1653.3107708897 | DE = -3.99e-07 | DW = 8.75e-10
+Time sweep =        5.901 | 188 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 204 MB (2%) | Imem = 99.0 KB (95%) | Hmem = 1.79 GB | Pmem = 5.90 MB
+ | Tread = 0.552 | Twrite = 0.581 | Tfpread = 0.539 | Tfpwrite = 0.576 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 541 MB | cpsd = 419 MB
+ | Trot = 0.317 | Tctr = 0.017 | Tint = 0.001 | Tmid = 0.000 | Tdctr = 0.391 | Tdiag = 0.104 | Tinfo = 0.010
+ | Teff = 1.679 | Tprt = 0.851 | Teig = 1.950 | Tblk = 4.972 | Tmve = 0.927 | Tdm = 0.090 | Tsplt = 0.335 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =   11 | Direction = backward | Bond dimension = 1500 | Noise =  1.00e-06 | Dav threshold =  1.00e-07
+ <-- Site =    9-  10 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 1.23e+10 Tdav = 0.00
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ <-- Site =    8-   9 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 1.98e+10 Tdav = 0.09
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.32
+ <-- Site =    7-   8 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 4.54e+10 Tdav = 0.19
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.49
+ <-- Site =    6-   7 .. Mmps =  126 Ndav =   6 Error = 0.00e+00 FLOPS = 1.46e+11 Tdav = 0.26
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.66
+ <-- Site =    5-   6 .. Mmps =  462 Ndav =  11 Error = 0.00e+00 FLOPS = 1.15e+11 Tdav = 0.41
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077095  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.64
+ <-- Site =    4-   5 .. Mmps = 1500 Ndav =   6 Error = 1.47e-09 FLOPS = 5.19e+10 Tdav = 0.50
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077095  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.97
+ <-- Site =    3-   4 .. Mmps = 1500 Ndav =   6 Error = 4.04e-11 FLOPS = 1.18e+11 Tdav = 0.36
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 1.55
+ <-- Site =    2-   3 .. Mmps = 1500 Ndav =   6 Error = 5.74e-22 FLOPS = 1.51e+10 Tdav = 0.57
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 1.71
+ <-- Site =    1-   2 .. Mmps =  718 Ndav =   6 Error = 1.26e-22 FLOPS = 1.83e+10 Tdav = 0.11
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.92
+ <-- Site =    0-   1 .. Mmps =  460 Ndav =   6 Error = 5.84e-23 FLOPS = 7.37e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.17
+Time elapsed =     50.231 | E[  6] =   -1653.3722200805  -1653.3107709453  -1653.3107709272  -1653.3107709118  -1653.3107708967  -1653.3107708916 | DE = -1.85e-09 | DW = 1.47e-09
+Time sweep =        7.438 | 163 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 216 MB (2%) | Imem = 99.0 KB (95%) | Hmem = 1.90 GB | Pmem = 5.90 MB
+ | Tread = 0.322 | Twrite = 0.667 | Tfpread = 0.311 | Tfpwrite = 0.663 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 555 MB | cpsd = 426 MB
+ | Trot = 0.316 | Tctr = 0.011 | Tint = 0.020 | Tmid = 0.000 | Tdctr = 0.016 | Tdiag = 0.086 | Tinfo = 0.008
+ | Teff = 1.772 | Tprt = 1.543 | Teig = 2.496 | Tblk = 6.412 | Tmve = 1.024 | Tdm = 0.097 | Tsplt = 0.392 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =   12 | Direction =  forward | Bond dimension = 1500 | Noise =  1.00e-06 | Dav threshold =  1.00e-07
+ --> Site =    0-   1 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 1.07e+10 Tdav = 0.00
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ --> Site =    1-   2 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 2.24e+10 Tdav = 0.09
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.33
+ --> Site =    2-   3 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 1.56e+10 Tdav = 0.55
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 1.12
+ --> Site =    3-   4 .. Mmps =  126 Ndav =   6 Error = 0.00e+00 FLOPS = 6.74e+10 Tdav = 0.63
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 1.24
+ --> Site =    4-   5 .. Mmps =  462 Ndav =  12 Error = 0.00e+00 FLOPS = 2.00e+11 Tdav = 0.26
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077094  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.42
+ --> Site =    5-   6 .. Mmps = 1500 Ndav =   6 Error = 7.88e-10 FLOPS = 2.27e+11 Tdav = 0.11
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077094  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.39
+ --> Site =    6-   7 .. Mmps = 1500 Ndav =   6 Error = 1.83e-10 FLOPS = 8.86e+10 Tdav = 0.44
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 1.64
+ --> Site =    7-   8 .. Mmps = 1500 Ndav =   6 Error = 3.59e-21 FLOPS = 5.21e+10 Tdav = 0.16
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 1.00
+ --> Site =    8-   9 .. Mmps =  929 Ndav =   6 Error = 1.29e-22 FLOPS = 1.66e+10 Tdav = 0.11
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.84
+ --> Site =    9-  10 .. Mmps =  656 Ndav =   6 Error = 6.52e-23 FLOPS = 8.36e+09 Tdav = 0.01
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.25
+Time elapsed =     57.482 | E[  6] =   -1653.3722200810  -1653.3107709448  -1653.3107709269  -1653.3107709118  -1653.3107708964  -1653.3107708913 | DE = 2.40e-10 | DW = 7.88e-10
+Time sweep =        7.251 | 167 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 216 MB (2%) | Imem = 99.0 KB (95%) | Hmem = 1.90 GB | Pmem = 5.90 MB
+ | Tread = 0.694 | Twrite = 0.671 | Tfpread = 0.681 | Tfpwrite = 0.652 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 550 MB | cpsd = 425 MB
+ | Trot = 0.305 | Tctr = 0.033 | Tint = 0.021 | Tmid = 0.000 | Tdctr = 0.330 | Tdiag = 0.095 | Tinfo = 0.010
+ | Teff = 2.235 | Tprt = 1.042 | Teig = 2.357 | Tblk = 6.208 | Tmve = 1.042 | Tdm = 0.090 | Tsplt = 0.383 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =   13 | Direction = backward | Bond dimension = 1500 | Noise =  1.00e-06 | Dav threshold =  1.00e-07
+ <-- Site =    9-  10 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 8.69e+09 Tdav = 0.01
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ <-- Site =    8-   9 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 1.49e+10 Tdav = 0.12
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.37
+ <-- Site =    7-   8 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 4.13e+10 Tdav = 0.21
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.51
+ <-- Site =    6-   7 .. Mmps =  126 Ndav =   6 Error = 0.00e+00 FLOPS = 1.31e+11 Tdav = 0.29
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.69
+ <-- Site =    5-   6 .. Mmps =  462 Ndav =  11 Error = 0.00e+00 FLOPS = 2.54e+11 Tdav = 0.19
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077095  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.30
+ <-- Site =    4-   5 .. Mmps = 1500 Ndav =   6 Error = 1.32e-09 FLOPS = 2.39e+11 Tdav = 0.11
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077095  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.33
+ <-- Site =    3-   4 .. Mmps = 1500 Ndav =   6 Error = 3.51e-11 FLOPS = 1.19e+11 Tdav = 0.36
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 1.51
+ <-- Site =    2-   3 .. Mmps = 1500 Ndav =   6 Error = 7.00e-22 FLOPS = 2.66e+10 Tdav = 0.32
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 1.30
+ <-- Site =    1-   2 .. Mmps =  688 Ndav =   6 Error = 1.18e-22 FLOPS = 2.06e+10 Tdav = 0.10
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.86
+ <-- Site =    0-   1 .. Mmps =  485 Ndav =   6 Error = 4.84e-23 FLOPS = 1.05e+10 Tdav = 0.00
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.18
+Time elapsed =     63.530 | E[  6] =   -1653.3722200808  -1653.3107709451  -1653.3107709268  -1653.3107709120  -1653.3107708965  -1653.3107708915 | DE = -1.95e-10 | DW = 1.32e-09
+Time sweep =        6.049 | 163 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 216 MB (2%) | Imem = 99.0 KB (95%) | Hmem = 1.90 GB | Pmem = 5.90 MB
+ | Tread = 0.288 | Twrite = 0.520 | Tfpread = 0.278 | Tfpwrite = 0.517 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 553 MB | cpsd = 424 MB
+ | Trot = 0.341 | Tctr = 0.006 | Tint = 0.006 | Tmid = 0.000 | Tdctr = 0.011 | Tdiag = 0.049 | Tinfo = 0.008
+ | Teff = 1.681 | Tprt = 1.201 | Teig = 1.700 | Tblk = 5.165 | Tmve = 0.882 | Tdm = 0.095 | Tsplt = 0.407 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =   14 | Direction =  forward | Bond dimension = 1500 | Noise =  1.00e-06 | Dav threshold =  1.00e-07
+ --> Site =    0-   1 .. Mmps =    3 Ndav =   6 Error = 0.00e+00 FLOPS = 5.21e+09 Tdav = 0.01
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ --> Site =    1-   2 .. Mmps =   10 Ndav =   6 Error = 0.00e+00 FLOPS = 1.58e+10 Tdav = 0.13
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.35
+ --> Site =    2-   3 .. Mmps =   35 Ndav =   6 Error = 0.00e+00 FLOPS = 1.98e+10 Tdav = 0.43
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.88
+ --> Site =    3-   4 .. Mmps =  126 Ndav =   6 Error = 0.00e+00 FLOPS = 1.05e+11 Tdav = 0.40
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077092  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.81
+ --> Site =    4-   5 .. Mmps =  462 Ndav =  12 Error = 0.00e+00 FLOPS = 2.00e+11 Tdav = 0.26
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077094  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.37
+ --> Site =    5-   6 .. Mmps = 1500 Ndav =   6 Error = 7.74e-10 FLOPS = 2.16e+11 Tdav = 0.12
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077094  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.34
+ --> Site =    6-   7 .. Mmps = 1500 Ndav =   6 Error = 1.33e-10 FLOPS = 1.16e+11 Tdav = 0.33
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 1.34
+ --> Site =    7-   8 .. Mmps = 1500 Ndav =   6 Error = 3.85e-21 FLOPS = 4.51e+10 Tdav = 0.19
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 1.13
+ --> Site =    8-   9 .. Mmps =  758 Ndav =   6 Error = 1.16e-22 FLOPS = 1.55e+10 Tdav = 0.12
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.84
+ --> Site =    9-  10 .. Mmps =  613 Ndav =   6 Error = 5.50e-23 FLOPS = 3.79e+08 Tdav = 0.10
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.36
+Time elapsed =     69.978 | E[  6] =   -1653.3722200812  -1653.3107709446  -1653.3107709262  -1653.3107709116  -1653.3107708960  -1653.3107708913 | DE = 2.77e-10 | DW = 7.74e-10
+Time sweep =        6.448 | 167 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 216 MB (2%) | Imem = 99.0 KB (95%) | Hmem = 1.90 GB | Pmem = 5.90 MB
+ | Tread = 0.568 | Twrite = 0.561 | Tfpread = 0.561 | Tfpwrite = 0.558 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 538 MB | cpsd = 416 MB
+ | Trot = 0.289 | Tctr = 0.017 | Tint = 0.011 | Tmid = 0.000 | Tdctr = 0.281 | Tdiag = 0.094 | Tinfo = 0.010
+ | Teff = 2.139 | Tprt = 0.817 | Teig = 2.088 | Tblk = 5.557 | Tmve = 0.889 | Tdm = 0.090 | Tsplt = 0.336 | Tsvd = 0.000 | Torth = 0.000
+
+Sweep =   15 | Direction = backward | Bond dimension = 1500 | Noise =  0.00e+00 | Dav threshold =  1.00e-08
+ <-- Site =    9-  10 .. Mmps =    3 Ndav =   8 Error = 0.00e+00 FLOPS = 9.78e+09 Tdav = 0.01
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.01
+ <-- Site =    8-   9 .. Mmps =   10 Ndav =   9 Error = 0.00e+00 FLOPS = 2.22e+10 Tdav = 0.12
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.37
+ <-- Site =    7-   8 .. Mmps =   35 Ndav =   7 Error = 0.00e+00 FLOPS = 3.82e+10 Tdav = 0.26
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.55
+ <-- Site =    6-   7 .. Mmps =  126 Ndav =  11 Error = 0.00e+00 FLOPS = 1.41e+11 Tdav = 0.50
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000) T = 0.93
+ <-- Site =    5-   6 .. Mmps =  462 Ndav =  12 Error = 0.00e+00 FLOPS = 2.44e+11 Tdav = 0.21
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077095  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.29
+ <-- Site =    4-   5 .. Mmps = 1500 Ndav =   6 Error = 1.45e-09 FLOPS = 2.37e+11 Tdav = 0.11
+          .. E[  0] =  -1653.37222008  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077095  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077090  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000) T = 0.22
+ <-- Site =    3-   4 .. Mmps = 1500 Ndav =   7 Error = 6.59e-20 FLOPS = 1.26e+11 Tdav = 0.39
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.98
+ <-- Site =    2-   3 .. Mmps = 1330 Ndav =   6 Error = 1.49e-22 FLOPS = 5.12e+10 Tdav = 0.19
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.75
+ <-- Site =    1-   2 .. Mmps =  462 Ndav =   6 Error = 2.17e-23 FLOPS = 2.20e+10 Tdav = 0.08
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.57
+ <-- Site =    0-   1 .. Mmps =  112 Ndav =   6 Error = 2.40e-24 FLOPS = 7.51e+09 Tdav = 0.00
+          .. E[  0] =  -1653.37222006  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  1] =  -1653.31077093  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  2] =  -1653.31077091  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  3] =  -1653.31077089  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  4] =  -1653.31077088  < N=11 S=1/2 PG=0 > (1.000000)
+          .. E[  5] =  -1653.31077087  < N=11 S=1/2 PG=0 > (1.000000) T = 0.09
+Time elapsed =     74.736 | E[  6] =   -1653.3722200818  -1653.3107709475  -1653.3107709287  -1653.3107709141  -1653.3107708987  -1653.3107708939 | DE = -2.61e-09 | DW = 1.45e-09
+Time sweep =        4.757 | 206 GFLOP/SWP
+ | Tcomm = 0.000 | Tidle = 0.000 | Twait = 0.000 | Dmem = 216 MB (2%) | Imem = 99.0 KB (95%) | Hmem = 1.90 GB | Pmem = 0 B
+ | Tread = 0.305 | Twrite = 0.513 | Tfpread = 0.296 | Tfpwrite = 0.510 | Tmporead = 0.000 | Tasync = 0.000
+ | data = 528 MB | cpsd = 404 MB
+ | Trot = 0.295 | Tctr = 0.001 | Tint = 0.001 | Tmid = 0.000 | Tdctr = 0.001 | Tdiag = 0.013 | Tinfo = 0.007
+ | Teff = 1.572 | Tprt = 0.000 | Teig = 1.870 | Tblk = 3.936 | Tmve = 0.820 | Tdm = 0.047 | Tsplt = 0.355 | Tsvd = 0.000 | Torth = 0.000
+
+split mps =  0
+split mps =  1
+split mps =  2
+split mps =  3
+split mps =  4
+split mps =  5
+DMRG FINISH TIME =  10/03/2022 12:34:14
+DMRG TIME  =               76.052
+compute pdm =  0 0
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.54e+08 Tmult = 0.00 T = 0.03
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.61e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 7.84e+08 Tmult = 0.02 T = 0.06
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.01e+10 Tmult = 0.00 T = 0.08
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.73e+09 Tmult = 0.02 T = 0.08
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.56e+10 Tmult = 0.00 T = 0.08
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.71e+10 Tmult = 0.01 T = 0.08
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.69e+09 Tmult = 0.02 T = 0.20
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.16e+09 Tmult = 0.02 T = 0.25
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.66e+08 Tmult = 0.03 T = 0.36
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.90e+09 Tmult = 0.00 T = 0.84
+Time elapsed =      2.075
+compute pdm =  1 0
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.63e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.63e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.34e+09 Tmult = 0.00 T = 0.05
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.05e+10 Tmult = 0.00 T = 0.04
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.88e+10 Tmult = 0.01 T = 0.05
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.95e+10 Tmult = 0.00 T = 0.03
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.19e+10 Tmult = 0.02 T = 0.16
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.49e+09 Tmult = 0.02 T = 0.27
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.21e+09 Tmult = 0.02 T = 0.35
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.74e+09 Tmult = 0.00 T = 0.50
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.71e+09 Tmult = 0.00 T = 1.54
+Time elapsed =      3.007
+compute pdm =  1 1
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.66e+06 Tmult = 0.02 T = 0.06
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.64e+07 Tmult = 0.02 T = 0.10
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 7.78e+08 Tmult = 0.02 T = 0.17
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.67e+09 Tmult = 0.02 T = 0.12
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.11e+09 Tmult = 0.02 T = 0.12
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.40e+09 Tmult = 0.02 T = 0.11
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 9.29e+09 Tmult = 0.02 T = 0.16
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.11e+09 Tmult = 0.01 T = 0.16
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.94e+09 Tmult = 0.01 T = 0.18
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.48e+09 Tmult = 0.00 T = 0.27
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.04e+08 Tmult = 0.02 T = 0.89
+Time elapsed =      2.334
+compute pdm =  2 0
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.11e+08 Tmult = 0.00 T = 0.01
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.67e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.12e+09 Tmult = 0.00 T = 0.05
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.07e+10 Tmult = 0.00 T = 0.04
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.58e+10 Tmult = 0.00 T = 0.04
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.08e+10 Tmult = 0.00 T = 0.02
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.02e+10 Tmult = 0.00 T = 0.12
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.18e+10 Tmult = 0.01 T = 0.19
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.21e+09 Tmult = 0.00 T = 0.29
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.66e+09 Tmult = 0.00 T = 0.54
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.95e+09 Tmult = 0.00 T = 1.63
+Time elapsed =      2.939
+compute pdm =  2 1
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.65e+06 Tmult = 0.02 T = 0.07
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.84e+07 Tmult = 0.02 T = 0.11
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 7.87e+08 Tmult = 0.02 T = 0.16
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.14e+09 Tmult = 0.02 T = 0.15
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.47e+09 Tmult = 0.02 T = 0.13
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.09e+10 Tmult = 0.00 T = 0.05
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.25e+10 Tmult = 0.01 T = 0.12
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.16e+10 Tmult = 0.01 T = 0.19
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.89e+09 Tmult = 0.00 T = 0.27
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.90e+09 Tmult = 0.00 T = 0.51
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.96e+09 Tmult = 0.00 T = 1.66
+Time elapsed =      3.424
+compute pdm =  2 2
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.82e+06 Tmult = 0.02 T = 0.06
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.72e+07 Tmult = 0.02 T = 0.10
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 7.82e+08 Tmult = 0.02 T = 0.12
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.79e+09 Tmult = 0.02 T = 0.12
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.68e+09 Tmult = 0.02 T = 0.11
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.48e+09 Tmult = 0.02 T = 0.11
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.83e+09 Tmult = 0.03 T = 0.17
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.36e+09 Tmult = 0.01 T = 0.17
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.82e+09 Tmult = 0.00 T = 0.18
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.63e+09 Tmult = 0.00 T = 0.31
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.27e+09 Tmult = 0.00 T = 0.89
+Time elapsed =      2.368
+compute pdm =  3 0
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.54e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.31e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.96e+09 Tmult = 0.01 T = 0.06
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 9.20e+09 Tmult = 0.00 T = 0.04
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.34e+10 Tmult = 0.00 T = 0.04
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.58e+09 Tmult = 0.02 T = 0.08
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 9.30e+09 Tmult = 0.02 T = 0.20
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.70e+09 Tmult = 0.02 T = 0.27
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.22e+09 Tmult = 0.02 T = 0.41
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.42e+08 Tmult = 0.02 T = 0.57
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.46e+09 Tmult = 0.00 T = 1.61
+Time elapsed =      3.281
+compute pdm =  3 1
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.60e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.61e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.12e+09 Tmult = 0.00 T = 0.04
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 9.11e+09 Tmult = 0.00 T = 0.05
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.47e+10 Tmult = 0.00 T = 0.04
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.71e+10 Tmult = 0.00 T = 0.03
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.02e+10 Tmult = 0.02 T = 0.15
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.32e+09 Tmult = 0.02 T = 0.22
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.21e+09 Tmult = 0.02 T = 0.37
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.22e+08 Tmult = 0.02 T = 0.58
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.05e+08 Tmult = 0.02 T = 1.67
+Time elapsed =      3.153
+compute pdm =  3 2
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.67e+06 Tmult = 0.02 T = 0.06
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.68e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.44e+09 Tmult = 0.00 T = 0.11
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.56e+09 Tmult = 0.01 T = 0.05
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.05e+10 Tmult = 0.01 T = 0.05
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.15e+10 Tmult = 0.00 T = 0.03
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.34e+10 Tmult = 0.01 T = 0.13
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.30e+10 Tmult = 0.01 T = 0.20
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.17e+09 Tmult = 0.00 T = 0.30
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.04e+09 Tmult = 0.00 T = 0.51
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.28e+09 Tmult = 0.00 T = 1.67
+Time elapsed =      3.114
+compute pdm =  3 3
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.54e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.53e+09 Tmult = 0.00 T = 0.00
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.29e+09 Tmult = 0.00 T = 0.02
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.08e+10 Tmult = 0.00 T = 0.03
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.69e+10 Tmult = 0.00 T = 0.03
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.18e+10 Tmult = 0.00 T = 0.02
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.96e+10 Tmult = 0.01 T = 0.07
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 9.99e+09 Tmult = 0.01 T = 0.13
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.65e+09 Tmult = 0.00 T = 0.17
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.98e+09 Tmult = 0.00 T = 0.27
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.07e+09 Tmult = 0.00 T = 0.87
+Time elapsed =      1.599
+compute pdm =  4 0
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.94e+06 Tmult = 0.03 T = 0.07
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.94e+07 Tmult = 0.02 T = 0.11
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.54e+08 Tmult = 0.02 T = 0.16
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.06e+09 Tmult = 0.02 T = 0.16
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.65e+09 Tmult = 0.02 T = 0.14
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.64e+10 Tmult = 0.00 T = 0.07
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.11e+10 Tmult = 0.00 T = 0.12
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.44e+10 Tmult = 0.01 T = 0.20
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.28e+09 Tmult = 0.00 T = 0.31
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.75e+09 Tmult = 0.00 T = 0.51
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.19e+09 Tmult = 0.00 T = 1.66
+Time elapsed =      3.509
+compute pdm =  4 1
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.41e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.32e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.60e+09 Tmult = 0.01 T = 0.04
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.36e+09 Tmult = 0.00 T = 0.04
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.48e+10 Tmult = 0.00 T = 0.04
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.23e+10 Tmult = 0.00 T = 0.03
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.60e+10 Tmult = 0.01 T = 0.12
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.71e+10 Tmult = 0.00 T = 0.18
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 7.96e+09 Tmult = 0.00 T = 0.32
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.41e+09 Tmult = 0.00 T = 0.49
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.40e+08 Tmult = 0.02 T = 1.68
+Time elapsed =      2.952
+compute pdm =  4 2
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.69e+06 Tmult = 0.02 T = 0.07
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.84e+07 Tmult = 0.02 T = 0.11
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.82e+08 Tmult = 0.02 T = 0.16
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.06e+09 Tmult = 0.02 T = 0.16
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.58e+09 Tmult = 0.02 T = 0.14
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.56e+09 Tmult = 0.02 T = 0.12
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 9.16e+09 Tmult = 0.02 T = 0.21
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.63e+09 Tmult = 0.02 T = 0.25
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.29e+09 Tmult = 0.02 T = 0.39
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.43e+09 Tmult = 0.00 T = 0.54
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.04e+08 Tmult = 0.02 T = 1.72
+Time elapsed =      3.872
+compute pdm =  4 3
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.67e+06 Tmult = 0.02 T = 0.07
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.48e+09 Tmult = 0.00 T = 0.07
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.52e+09 Tmult = 0.01 T = 0.04
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.46e+09 Tmult = 0.00 T = 0.05
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.59e+10 Tmult = 0.00 T = 0.05
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.60e+10 Tmult = 0.00 T = 0.03
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.00e+10 Tmult = 0.00 T = 0.12
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.23e+10 Tmult = 0.01 T = 0.21
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.44e+09 Tmult = 0.00 T = 0.34
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.33e+08 Tmult = 0.02 T = 0.57
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.30e+09 Tmult = 0.00 T = 1.89
+Time elapsed =      3.452
+compute pdm =  4 4
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.46e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.03e+09 Tmult = 0.00 T = 0.00
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.39e+09 Tmult = 0.00 T = 0.02
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.02e+10 Tmult = 0.00 T = 0.02
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.82e+10 Tmult = 0.00 T = 0.02
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.77e+10 Tmult = 0.00 T = 0.02
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.01e+10 Tmult = 0.01 T = 0.07
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.07e+10 Tmult = 0.01 T = 0.13
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.87e+09 Tmult = 0.00 T = 0.19
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.30e+09 Tmult = 0.00 T = 0.26
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.12e+08 Tmult = 0.02 T = 0.94
+Time elapsed =      1.691
+compute pdm =  5 0
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.43e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.28e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.66e+09 Tmult = 0.01 T = 0.04
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.89e+09 Tmult = 0.00 T = 0.04
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.61e+10 Tmult = 0.00 T = 0.04
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.20e+10 Tmult = 0.00 T = 0.03
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.78e+10 Tmult = 0.01 T = 0.13
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.75e+10 Tmult = 0.00 T = 0.19
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.28e+09 Tmult = 0.02 T = 0.36
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.68e+08 Tmult = 0.02 T = 0.56
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.01e+08 Tmult = 0.02 T = 1.74
+Time elapsed =      3.135
+compute pdm =  5 1
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.64e+06 Tmult = 0.02 T = 0.08
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.71e+07 Tmult = 0.02 T = 0.11
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.58e+08 Tmult = 0.02 T = 0.17
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.06e+09 Tmult = 0.02 T = 0.15
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.60e+09 Tmult = 0.02 T = 0.14
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.57e+09 Tmult = 0.02 T = 0.13
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.16e+10 Tmult = 0.02 T = 0.22
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.42e+10 Tmult = 0.01 T = 0.19
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.11e+09 Tmult = 0.00 T = 0.29
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.42e+09 Tmult = 0.00 T = 0.46
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.34e+09 Tmult = 0.00 T = 1.77
+Time elapsed =      3.706
+compute pdm =  5 2
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.69e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.55e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.56e+09 Tmult = 0.01 T = 0.04
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.43e+09 Tmult = 0.00 T = 0.04
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.69e+10 Tmult = 0.00 T = 0.03
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.16e+10 Tmult = 0.00 T = 0.03
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.14e+10 Tmult = 0.00 T = 0.12
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.73e+10 Tmult = 0.00 T = 0.18
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.20e+09 Tmult = 0.00 T = 0.31
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.60e+09 Tmult = 0.00 T = 0.49
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.46e+09 Tmult = 0.00 T = 1.74
+Time elapsed =      2.999
+compute pdm =  5 3
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.79e+07 Tmult = 0.00 T = 0.04
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.97e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.61e+09 Tmult = 0.01 T = 0.04
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.45e+09 Tmult = 0.00 T = 0.05
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.89e+10 Tmult = 0.01 T = 0.04
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.13e+10 Tmult = 0.00 T = 0.02
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.12e+10 Tmult = 0.00 T = 0.12
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.42e+10 Tmult = 0.01 T = 0.21
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.72e+09 Tmult = 0.00 T = 0.37
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 6.11e+09 Tmult = 0.00 T = 0.50
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.31e+08 Tmult = 0.02 T = 1.72
+Time elapsed =      3.125
+compute pdm =  5 4
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.28e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.53e+09 Tmult = 0.00 T = 0.01
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.54e+09 Tmult = 0.01 T = 0.05
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.43e+09 Tmult = 0.00 T = 0.04
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.09e+10 Tmult = 0.01 T = 0.04
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.32e+10 Tmult = 0.00 T = 0.03
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.63e+10 Tmult = 0.01 T = 0.14
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 8.15e+09 Tmult = 0.01 T = 0.19
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 7.07e+09 Tmult = 0.00 T = 0.32
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.17e+09 Tmult = 0.00 T = 0.52
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.10e+09 Tmult = 0.00 T = 1.65
+Time elapsed =      2.985
+compute pdm =  5 5
+init .. R = 9
+init .. R = 8
+init .. R = 7
+init .. R = 6
+init .. R = 5
+init .. R = 4
+init .. R = 3
+init .. R = 2
+init .. R = 1
+init .. R = 0
+Expectation | Direction =  forward | BRA bond dimension = 1500 | KET bond dimension = 1500
+ --> Site =    0 ..  Nterms =     21 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.68e+08 Tmult = 0.00 T = 0.00
+ --> Site =    1 ..  Nterms =     19 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.32e+09 Tmult = 0.00 T = 0.00
+ --> Site =    2 ..  Nterms =     17 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.59e+09 Tmult = 0.00 T = 0.02
+ --> Site =    3 ..  Nterms =     15 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.00e+10 Tmult = 0.00 T = 0.03
+ --> Site =    4 ..  Nterms =     13 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.85e+10 Tmult = 0.00 T = 0.02
+ --> Site =    5 ..  Nterms =     11 Error =  0.000000000000/ 0.000000000000 FLOPS = 5.17e+10 Tmult = 0.00 T = 0.02
+ --> Site =    6 ..  Nterms =      9 Error =  0.000000000000/ 0.000000000000 FLOPS = 2.27e+10 Tmult = 0.01 T = 0.08
+ --> Site =    7 ..  Nterms =      7 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.02e+10 Tmult = 0.01 T = 0.12
+ --> Site =    8 ..  Nterms =      5 Error =  0.000000000000/ 0.000000000000 FLOPS = 4.94e+09 Tmult = 0.01 T = 0.19
+ --> Site =    9 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 3.36e+09 Tmult = 0.00 T = 0.25
+ --> Site =   10 ..  Nterms =      4 Error =  0.000000000000/ 0.000000000000 FLOPS = 1.01e+08 Tmult = 0.02 T = 0.89
+Time elapsed =      1.626
+1PDM FINISH TIME =  10/03/2022 12:35:26
+1PDM TIME  =               72.423
+HSO.SHAPE =  (3, 11, 11)
+PDMS.SHAPE =  (6, 6, 11, 11)
+I1 =    2 (E1 =  -1653.31077093) S1 =  0.5 MS1 = -0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 = -0.5 Re =     0.000 Im =   174.242
+I1 =    2 (E1 =  -1653.31077093) S1 =  0.5 MS1 = -0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 =  0.5 Re =  -167.474 Im =   -77.724
+I1 =    2 (E1 =  -1653.31077093) S1 =  0.5 MS1 =  0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 = -0.5 Re =   167.474 Im =   -77.724
+I1 =    2 (E1 =  -1653.31077093) S1 =  0.5 MS1 =  0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 =  0.5 Re =     0.000 Im =  -174.242
+I1 =    3 (E1 =  -1653.31077091) S1 =  0.5 MS1 = -0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 = -0.5 Re =     0.000 Im =  -401.331
+I1 =    3 (E1 =  -1653.31077091) S1 =  0.5 MS1 = -0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 =  0.5 Re =  -304.036 Im =   -85.683
+I1 =    3 (E1 =  -1653.31077091) S1 =  0.5 MS1 =  0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 = -0.5 Re =   304.036 Im =   -85.683
+I1 =    3 (E1 =  -1653.31077091) S1 =  0.5 MS1 =  0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 =  0.5 Re =     0.000 Im =   401.331
+I1 =    3 (E1 =  -1653.31077091) S1 =  0.5 MS1 = -0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 = -0.5 Re =     0.000 Im =    56.649
+I1 =    3 (E1 =  -1653.31077091) S1 =  0.5 MS1 = -0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 =  0.5 Re =  -217.500 Im =   425.886
+I1 =    3 (E1 =  -1653.31077091) S1 =  0.5 MS1 =  0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 = -0.5 Re =   217.500 Im =   425.886
+I1 =    3 (E1 =  -1653.31077091) S1 =  0.5 MS1 =  0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 =  0.5 Re =     0.000 Im =   -56.649
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 = -0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 = -0.5 Re =     0.000 Im =   -51.312
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 = -0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 =  0.5 Re =  -238.246 Im =   348.779
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 =  0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 = -0.5 Re =   238.246 Im =   348.779
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 =  0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 =  0.5 Re =     0.000 Im =    51.312
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 = -0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 = -0.5 Re =     0.000 Im =    39.101
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 = -0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 =  0.5 Re =  -625.620 Im =  -443.070
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 =  0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 = -0.5 Re =   625.620 Im =  -443.070
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 =  0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 =  0.5 Re =     0.000 Im =   -39.101
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 = -0.5 I2 =    3 (E2 =  -1653.31077091) S2 =  0.5 MS2 = -0.5 Re =     0.000 Im =   405.711
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 = -0.5 I2 =    3 (E2 =  -1653.31077091) S2 =  0.5 MS2 =  0.5 Re =   291.265 Im =    88.546
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 =  0.5 I2 =    3 (E2 =  -1653.31077091) S2 =  0.5 MS2 = -0.5 Re =  -291.265 Im =    88.546
+I1 =    4 (E1 =  -1653.31077090) S1 =  0.5 MS1 =  0.5 I2 =    3 (E2 =  -1653.31077091) S2 =  0.5 MS2 =  0.5 Re =     0.000 Im =  -405.711
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 = -0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 = -0.5 Re =     0.000 Im =  -698.645
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 = -0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 =  0.5 Re =   210.343 Im =   133.463
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 =  0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 = -0.5 Re =  -210.343 Im =   133.463
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 =  0.5 I2 =    1 (E2 =  -1653.31077095) S2 =  0.5 MS2 =  0.5 Re =     0.000 Im =   698.645
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 = -0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 =  0.5 Re =   251.828 Im =  -327.634
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 =  0.5 I2 =    2 (E2 =  -1653.31077093) S2 =  0.5 MS2 = -0.5 Re =  -251.828 Im =  -327.634
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 = -0.5 I2 =    3 (E2 =  -1653.31077091) S2 =  0.5 MS2 = -0.5 Re =     0.000 Im =  -121.694
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 = -0.5 I2 =    3 (E2 =  -1653.31077091) S2 =  0.5 MS2 =  0.5 Re =   245.727 Im =  -480.925
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 =  0.5 I2 =    3 (E2 =  -1653.31077091) S2 =  0.5 MS2 = -0.5 Re =  -245.727 Im =  -480.925
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 =  0.5 I2 =    3 (E2 =  -1653.31077091) S2 =  0.5 MS2 =  0.5 Re =     0.000 Im =   121.694
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 = -0.5 I2 =    4 (E2 =  -1653.31077090) S2 =  0.5 MS2 = -0.5 Re =     0.000 Im =   118.098
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 = -0.5 I2 =    4 (E2 =  -1653.31077090) S2 =  0.5 MS2 =  0.5 Re =  -107.626 Im =   -58.397
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 =  0.5 I2 =    4 (E2 =  -1653.31077090) S2 =  0.5 MS2 = -0.5 Re =   107.626 Im =   -58.397
+I1 =    5 (E1 =  -1653.31077089) S1 =  0.5 MS1 =  0.5 I2 =    4 (E2 =  -1653.31077090) S2 =  0.5 MS2 =  0.5 Re =     0.000 Im =  -118.098
+SYMM Error (should be small) =  2.4534517037608604e-18
+Total energies including SO-coupling:
+
+ State    0 Total energy:  -1653.37222008 <S^2>:     0.750000 | largest |coeff|**2   1.000000 from I =    0 E =  -1653.37222008 S =  0.5
+ State    1 Total energy:  -1653.37222008 <S^2>:     0.750000 | largest |coeff|**2   1.000000 from I =    0 E =  -1653.37222008 S =  0.5
+ State    2 Total energy:  -1653.31459481 <S^2>:     0.750000 | largest |coeff|**2   0.498970 from I =    1 E =  -1653.31077095 S =  0.5
+ State    3 Total energy:  -1653.31459481 <S^2>:     0.750000 | largest |coeff|**2   0.498971 from I =    1 E =  -1653.31077095 S =  0.5
+ State    4 Total energy:  -1653.31459480 <S^2>:     0.750000 | largest |coeff|**2   0.400905 from I =    2 E =  -1653.31077093 S =  0.5
+ State    5 Total energy:  -1653.31459480 <S^2>:     0.750000 | largest |coeff|**2   0.400906 from I =    2 E =  -1653.31077093 S =  0.5
+ State    6 Total energy:  -1653.31459478 <S^2>:     0.750000 | largest |coeff|**2   0.340924 from I =    5 E =  -1653.31077089 S =  0.5
+ State    7 Total energy:  -1653.31459478 <S^2>:     0.750000 | largest |coeff|**2   0.340910 from I =    5 E =  -1653.31077089 S =  0.5
+ State    8 Total energy:  -1653.30503510 <S^2>:     0.750000 | largest |coeff|**2   0.371434 from I =    1 E =  -1653.31077095 S =  0.5
+ State    9 Total energy:  -1653.30503510 <S^2>:     0.750000 | largest |coeff|**2   0.371429 from I =    1 E =  -1653.31077095 S =  0.5
+ State   10 Total energy:  -1653.30503509 <S^2>:     0.750000 | largest |coeff|**2   0.333026 from I =    2 E =  -1653.31077093 S =  0.5
+ State   11 Total energy:  -1653.30503509 <S^2>:     0.750000 | largest |coeff|**2   0.333038 from I =    2 E =  -1653.31077093 S =  0.5
+
+E 2D(5/2)         =     1.5681 eV
+E 2D(3/2)         =     1.8282 eV
+2D(5/2) - 2D(3/2) =     0.2601 eV
+DIAG FINISH TIME =  10/03/2022 12:35:26
+DIAG TIME  =                0.011
+MPI FINALIZE: rank 0 of 1

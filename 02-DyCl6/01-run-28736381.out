@@ -1,0 +1,107 @@
+START TIME =  10/03/2022 13:17:16
+MPI INIT: rank 0 of 1
+#INFO: **** input file is /central/groups/changroup/members/hczhai/work/soc-proj-data-final/02-DyCl6/01-dy-7o-dzbp-mf-2step-sr42.py ****
+
+import time
+from datetime import datetime
+txst = time.perf_counter()
+print("START TIME = ", datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
+
+from pyscf import scf, mcscf, gto
+from pyblock2.driver.core import DMRGDriver, SymmetryTypes
+from pyblock2._pyscf.ao2mo import soc_integrals as itgsoc
+from pyblock2._pyscf.ao2mo import integrals as itg
+import numpy as np
+import pickle
+
+fidx = 1
+
+driver = DMRGDriver(
+    scratch="/central/scratch/hczhai/soc-05-%02d" % fidx, symm_type=SymmetryTypes.SGFCPX, n_threads=28,
+    stack_mem=int(40E9), mpi=True
+)
+
+b = 2.72
+
+coords = [
+    ["Dy", [0, 0, 0]],
+    ["Cl", [-b, 0, 0]],
+    ["Cl", [b, 0, 0]],
+    ["Cl", [0, -b, 0]],
+    ["Cl", [0, b, 0]],
+    ["Cl", [0, 0, -b]],
+    ["Cl", [0, 0, b]],
+]
+
+mol = gto.M(atom=coords, basis={"Dy": "ano@7s6p4d2f", "Cl": "ano@4s3p"},
+            verbose=4, spin=5, charge=-3, max_memory=100000)
+print('basis = dz nelec = %d nao = %d' % (mol.nelectron, mol.nao))
+
+mf = scf.RHF(mol).x2c()
+
+mf.mo_coeff, mf.mo_occ, mf.mo_energy, nactorb, nactelec, dmao = pickle.load(open("00-cas-data.bin", "rb"))
+
+mc = mcscf.CASCI(mf, nactorb, nactelec)
+
+ncore = mc.ncore
+ncas = mc.ncas
+print('ncore = ', ncore, ' ncas = ', ncas)
+
+ncas, n_elec, spin, ecore, h1e, g2e, orb_sym = itg.get_rhf_integrals(mf, ncore, ncas, pg_symm=False)
+hsoao = itgsoc.get_somf_hsoao(mf, dmao=dmao, amfi=True, x2c1e=False, x2c2e=False)
+hso = np.einsum('rij,ip,jq->rpq', hsoao,
+    mf.mo_coeff[:, ncore:ncore + ncas],
+    mf.mo_coeff[:, ncore:ncore + ncas], optimize=True)
+
+idx = driver.orbital_reordering(np.abs(h1e), np.abs(g2e))
+print('reordering = ', idx)
+h1e = h1e[idx][:, idx]
+g2e = g2e[idx][:, idx][:, :, idx][:, :, :, idx]
+
+pickle.dump((ncas, n_elec, spin, ecore, h1e, g2e, orb_sym, hso, idx), open("%02d-mf-data.bin" % fidx, "wb"))
+
+txed = time.perf_counter()
+print("MF FINISH TIME = ", datetime.now().strftime("%m/%d/%Y %H:%M:%S"))
+print("MF TIME  = %20.3f" % (txed - txst))
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='hpc-21-22.cm.cluster', release='3.10.0-1160.53.1.el7.x86_64', version='#1 SMP Fri Jan 14 13:59:45 UTC 2022', machine='x86_64', processor='x86_64')  Threads 28
+Python 3.8.5 (default, Sep  4 2020, 07:30:14) 
+[GCC 7.3.0]
+numpy 1.19.4  scipy 1.4.1
+Date: Mon Oct  3 13:17:19 2022
+PySCF version 2.0.1
+PySCF path  /central/groups/changroup/members/hczhai/program/pyscf
+GIT HEAD (branch master) 9d5b5bd309d1cc55fbd1a0ec76e26b5b0c7f76af
+
+[ENV] PYSCF_TMPDIR /central/scratch/hczhai/soc-pyscf-tmp
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 7
+[INPUT] num. electrons = 171
+[INPUT] charge = -3
+[INPUT] spin (= nelec alpha-beta = 2S) = 5
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT]  1 Dy     0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr
+[INPUT]  2 Cl    -2.720000000000   0.000000000000   0.000000000000 AA   -5.140055058817   0.000000000000   0.000000000000 Bohr
+[INPUT]  3 Cl     2.720000000000   0.000000000000   0.000000000000 AA    5.140055058817   0.000000000000   0.000000000000 Bohr
+[INPUT]  4 Cl     0.000000000000  -2.720000000000   0.000000000000 AA    0.000000000000  -5.140055058817   0.000000000000 Bohr
+[INPUT]  5 Cl     0.000000000000   2.720000000000   0.000000000000 AA    0.000000000000   5.140055058817   0.000000000000 Bohr
+[INPUT]  6 Cl     0.000000000000   0.000000000000  -2.720000000000 AA    0.000000000000   0.000000000000  -5.140055058817 Bohr
+[INPUT]  7 Cl     0.000000000000   0.000000000000   2.720000000000 AA    0.000000000000   0.000000000000   5.140055058817 Bohr
+
+nuclear repulsion = 1871.13682773829
+number of shells = 16
+number of NR pGTOs = 561
+number of NR cGTOs = 137
+basis = {'Dy': 'ano@7s6p4d2f', 'Cl': 'ano@4s3p'}
+ecp = {}
+CPU time:         0.61
+basis = dz nelec = 171 nao = 137
+ncore =  81  ncas =  7
+reordering =  [3 6 2 4 1 0 5]
+MF FINISH TIME =  10/03/2022 13:18:01
+MF TIME  =               44.564
+MPI FINALIZE: rank 0 of 1
