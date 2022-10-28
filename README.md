@@ -4,7 +4,7 @@ Data for ab initio Density Matrix Renormalization Group (DMRG) with Spin-Orbit C
 
 This includes the input and output files for the following paper:
 
-* Huanchen Zhai, and Garnet Kin-Lic Chan. "A comparison between the one-and two-step spin-orbit coupling approaches based on the ab initio Density Matrix Renormalization Group." The Journal of Chemical Physics (2022). doi: [10.1063/5.0107805](https://doi.org/10.1063/5.0107805).
+* Huanchen Zhai, and Garnet Kin-Lic Chan. "A comparison between the one-and two-step spin-orbit coupling approaches based on the ab initio Density Matrix Renormalization Group." J. Chem. Phys. **157**, 164108 (2022). doi: [10.1063/5.0107805](https://doi.org/10.1063/5.0107805).
 
 Software dependences:
 
@@ -34,5 +34,3 @@ Files:
   - [04] 2-step SU2-DMRG without SOC (depends on [01])
   - [05] 2-step SU2-DMRG 1TTDM (depends on [04])
   - [06] 2-step effective Hamiltonian diagonalization (depends on [05])
-
-Note that the monomer energy levels are slightly different from the data in the paper due to the tighter DMRG-CASSCF convergence threshold used here.
